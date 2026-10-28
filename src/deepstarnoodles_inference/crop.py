@@ -109,18 +109,24 @@ def _result_detections(
     return detections
 
 
-def _centered_square_crop(
-    image_bgr: np.ndarray,
-    xyxy: tuple[float, float, float, float],
-    context_scale: float,
-) -> tuple[np.ndarray, float, float, float]:
-    h, w = image_bgr.shape[:2]
+def _square_crop_geometry(xyxy, context_scale):
+    """Integer geometry shared by crop allocation and archive reservations."""
     x1, y1, x2, y2 = xyxy
     cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
     side = int(math.ceil(max(max(1.0, x2 - x1), max(1.0, y2 - y1)) * context_scale))
     side = max(16, side)
     left = int(round(cx - side / 2.0))
     top = int(round(cy - side / 2.0))
+    return left, top, side
+
+
+def _centered_square_crop(
+    image_bgr: np.ndarray,
+    xyxy: tuple[float, float, float, float],
+    context_scale: float,
+) -> tuple[np.ndarray, float, float, float]:
+    h, w = image_bgr.shape[:2]
+    left, top, side = _square_crop_geometry(xyxy, context_scale)
     src_l, src_t = max(0, left), max(0, top)
     src_r, src_b = min(w, left + side), min(h, top + side)
     crop = image_bgr[src_t:src_b, src_l:src_r]

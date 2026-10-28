@@ -32,6 +32,8 @@ def parse_args(argv=None):
     p.add_argument("--max-spool-gib", type=float, default=8.0)
     extra, rest = p.parse_known_args(argv)
     args = b.parse_args(rest)
+    if args.archive_frame_window:
+        raise ValueError("--archive-frame-window is resident archive-only; staged scheduling already buffers disk shards")
     if args.mode != "archive" or args.warmup != 0:
         raise ValueError("staged-archive requires --mode archive --warmup 0; stage startup is part of its job cost")
     if extra.shard_size < 1 or not np.isfinite(extra.max_spool_gib) or extra.max_spool_gib <= 0:

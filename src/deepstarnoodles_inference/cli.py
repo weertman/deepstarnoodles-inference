@@ -10,7 +10,7 @@ import sys
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Self-contained StarSeg → Hydra → GRU inference")
-    parser.add_argument("command", choices=("benchmark", "archive", "live", "live-replay", "staged-archive", "verify-models", "fetch-models", "smoke"))
+    parser.add_argument("command", choices=("benchmark", "archive", "live", "live-replay", "staged-archive", "verify-models", "fetch-models", "compare", "smoke"))
     if not argv or argv[0] in ("-h", "--help"):
         parser.print_help()
         return 0
@@ -31,6 +31,9 @@ def main(argv=None):
             if not any(value == "--warmup" or value.startswith("--warmup=") for value in remaining):
                 remaining += ["--warmup", "0"]
             remaining += ["--mode", args.command]
+        return run(remaining)
+    if args.command == "compare":
+        from .compare_cli import main as run
         return run(remaining)
     if args.command == "live":
         from .live import main as run

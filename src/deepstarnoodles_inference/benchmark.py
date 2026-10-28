@@ -49,6 +49,10 @@ def parse_args(argv=None):
     p.add_argument("--warmup", type=int, default=8, help="First N inputs, replayed separately before measurement")
     p.add_argument("--detector-batch-size", type=int, default=1)
     p.add_argument("--crop-batch-size", type=int, default=1)
+    p.add_argument("--archive-frame-window", type=int, default=0,
+                   help="Experimental resident archive crop accumulation: max pending source records (0 disables, 1-256)")
+    p.add_argument("--archive-crop-buffer-mib", type=int, default=256,
+                   help="Maximum retained RGB crop/polygon arrays in buffered archives (1-1024 MiB); oversized crops fail before allocation")
     p.add_argument("--hydra-batch-size", type=int, default=None,
                    help="Experimental: cap Hydra forward batch independently of the GRU crop batch; omitted uses the full crop batch")
     p.add_argument("--decode-workers", type=int, choices=(0, 1, 2, 4), default=0,
@@ -76,6 +80,12 @@ def parse_args(argv=None):
         p.error("--gru-check-interval must be between 1 and 128")
     if min(args.images, args.detector_batch_size, args.crop_batch_size) < 1 or args.warmup < 0:
         p.error("image/batch counts must be positive and warmup non-negative")
+    if not 0 <= args.archive_frame_window <= 256 or not 1 <= args.archive_crop_buffer_mib <= 1024:
+        p.error("archive frame window must be 0-256 and crop buffer MiB must be 1-1024")
+    if args.archive_frame_window and (args.mode != "archive" or args.detector_batch_size != 1):
+        p.error("archive crop accumulation requires --mode archive --detector-batch-size 1")
+    if args.archive_frame_window and args.crop_batch_size > 128:
+        p.error("archive crop accumulation requires --crop-batch-size <= 128")
     if args.hydra_batch_size is not None and args.hydra_batch_size < 1:
         p.error("--hydra-batch-size must be positive")
     if (not 1 <= args.decode_prefetch_frames <= 64
@@ -238,6 +248,21 @@ class Cascade:
         must supply a contiguous processed index here, and record its source
         acquisition sequence separately.
         """
+        frames, records, observations = self.detect_frames(frames, start_index, timer, source_paths=source_paths)
+        total_arms = 0
+        for group in chunks(observations, self.args.crop_batch_size):
+            with timer.stage("crop_preprocess_transfer"):
+                crop_group = [(i, j, (item if self.live_cropper else _crop_result(
+                    frames[i], item, context_scale=self.crop_config.context_scale))) for i, j, item in group]
+                images = self.preprocess_crops(crop_group)
+            total_arms += self.infer_crops(crop_group, images, records, start_index, timer)
+            del images, crop_group
+        if self.live_cropper:
+            self.registry.prune(start_index)
+        return records, len(observations), total_arms
+
+    def detect_frames(self, frames, start_index, timer, *, source_paths=None):
+        """Validate and detect; observations use local source indices as before."""
         if not frames:
             raise ValueError("at least one source frame is required")
         if self.live_cropper and len(frames) != 1:
@@ -269,56 +294,59 @@ class Cascade:
                 observations = [(i, j, det) for i, result in enumerate(predictions)
                                 for j, det in enumerate(_result_detections(result, self.sunflower_ids, require_track_ids=False))]
                 del predictions
+        return frames, records, observations
+
+    def preprocess_crops(self, crop_group):
+        """Training-time crop preparation shared by immediate/buffered archives."""
+        images = self.hydra.preprocess_batch([c.crop_rgb for _, _, c in crop_group]).to(self.device)
+        if self.args.channels_last:
+            images = images.contiguous(memory_format=torch.channels_last)
+        return images
+
+    def infer_crops(self, crop_group, images, records, start_index, timer):
+        """One ordered Hydra/GRU group; update indexed source records in place."""
         total_arms = 0
-        for group in chunks(observations, self.args.crop_batch_size):
-            with timer.stage("crop_preprocess_transfer"):
-                crop_group = [(i, j, (item if self.live_cropper else _crop_result(
-                    frames[i], item, context_scale=self.crop_config.context_scale))) for i, j, item in group]
-                images = self.hydra.preprocess_batch([c.crop_rgb for _, _, c in crop_group]).to(self.device)
-                if self.args.channels_last:
-                    images = images.contiguous(memory_format=torch.channels_last)
-            with timer.stage("hydra"):
-                minimal = getattr(self.args, "hydra_output_mode", "full") == "minimal"
-                raw, activated = predict_hydra_crops(
-                    self.hydra, images, batch_size=getattr(self.args, "hydra_batch_size", None),
-                    minimal=minimal, tracking=self.live_cropper is not None)
-            with timer.stage("gru"):
-                if getattr(self.args, "gru_execution", "dynamic") == "fixed":
-                    from .noodle_tracer_fixed import trace_arms_noodle_batch_fixed_slots
-                    decoded = trace_arms_noodle_batch_fixed_slots(
-                        raw, images, self.tracer, self.trace_params,
-                        check_interval=getattr(self.args, "gru_check_interval", 8))
+        with timer.stage("hydra"):
+            minimal = getattr(self.args, "hydra_output_mode", "full") == "minimal"
+            raw, activated = predict_hydra_crops(
+                self.hydra, images, batch_size=getattr(self.args, "hydra_batch_size", None),
+                minimal=minimal, tracking=self.live_cropper is not None)
+        with timer.stage("gru"):
+            if getattr(self.args, "gru_execution", "dynamic") == "fixed":
+                from .noodle_tracer_fixed import trace_arms_noodle_batch_fixed_slots
+                decoded = trace_arms_noodle_batch_fixed_slots(
+                    raw, images, self.tracer, self.trace_params,
+                    check_interval=getattr(self.args, "gru_check_interval", 8))
+            else:
+                decoded = trace_arms_noodle_batch(raw, images, self.tracer, self.trace_params)
+        with timer.stage("postprocess_track"):
+            for k, ((i, j, crop), arms) in enumerate(zip(crop_group, decoded)):
+                if self.live_cropper:
+                    tracking_options = {"support_mouth_only": True} if minimal else {}
+                    labels = self.registry.track(crop.star_track_id, start_index + i,
+                                                 activated[k].cpu().numpy(), arms, **tracking_options)
                 else:
-                    decoded = trace_arms_noodle_batch(raw, images, self.tracer, self.trace_params)
-            with timer.stage("postprocess_track"):
-                for k, ((i, j, crop), arms) in enumerate(zip(crop_group, decoded)):
-                    if self.live_cropper:
-                        tracking_options = {"support_mouth_only": True} if minimal else {}
-                        labels = self.registry.track(crop.star_track_id, start_index + i,
-                                                     activated[k].cpu().numpy(), arms, **tracking_options)
-                    else:
-                        labels = list(range(len(arms)))
-                    arm_records = source_arm_records(arms, labels, crop, model_size=self.hydra.image_size)
-                    for record, arm in zip(arm_records, arms):
-                        for key in ("stop_reason", "steps", "state_confidence", "tip_score", "base_score", "length_px"):
-                            if key in arm:
-                                record[key] = arm[key]
-                    if not self.live_cropper:
-                        for record in arm_records:
-                            record["arm_index"] = record.pop("track_id")
-                    records[i]["stars"].append({"detection_index": j, "star_track_id": crop.star_track_id,
-                                                "crop": crop_record(crop),
-                                                "mask_polygon_source": crop.mask_polygon.tolist() if crop.mask_polygon is not None else None,
-                                                "arms": arm_records})
-                    total_arms += len(arms)
-            # Release tensors before the next micro-batch forward is evaluated.
-            del images, raw, activated, decoded, crop_group
-        if self.live_cropper:
-            self.registry.prune(start_index)
-        return records, len(observations), total_arms
+                    labels = list(range(len(arms)))
+                arm_records = source_arm_records(arms, labels, crop, model_size=self.hydra.image_size)
+                for record, arm in zip(arm_records, arms):
+                    for key in ("stop_reason", "steps", "state_confidence", "tip_score", "base_score", "length_px"):
+                        if key in arm:
+                            record[key] = arm[key]
+                if not self.live_cropper:
+                    for record in arm_records:
+                        record["arm_index"] = record.pop("track_id")
+                records[i]["stars"].append({"detection_index": j, "star_track_id": crop.star_track_id,
+                                            "crop": crop_record(crop),
+                                            "mask_polygon_source": crop.mask_polygon.tolist() if crop.mask_polygon is not None else None,
+                                            "arms": arm_records})
+                total_arms += len(arms)
+        return total_arms
 
 
 def measure(pipeline, args, count, sink, profile):
+    if getattr(args, "archive_frame_window", 0):
+        from .archive_buffer import measure_buffered_archive
+        return measure_buffered_archive(pipeline, args, count, sink, profile)
     timer = Timer(pipeline.device, profile)
     groups_ms, source_count, crop_count, arm_count, empty_count = [], 0, 0, 0, 0
     timer.sync()

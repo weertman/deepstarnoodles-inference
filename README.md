@@ -72,6 +72,21 @@ deepstarnoodles-inference staged-archive --models models/ --index inputs/archive
 
 `--shard-size` bounds the number of source images processed before reloading stages; `--max-spool-gib` bounds live intermediate files and stops the run if exceeded. Stage initialization and spool I/O are included in job time. Staged archive defaults to archive mode with zero warmup; its default image limit is 128, so set `--images` explicitly for a full workload.
 
+Cross-frame crop accumulation is a separate experimental resident archive schedule. It keeps detector calls at one full image while filling Hydra/GRU crop groups from successive independent source images:
+
+```bash
+deepstarnoodles-inference archive --models models/ --index inputs/archive.csv \
+  --output outputs/crop-window --detector-batch-size 1 --crop-batch-size 8 \
+  --hydra-batch-size 1 --hydra-output-mode minimal \
+  --archive-frame-window 64 --archive-crop-buffer-mib 256
+```
+
+`--archive-frame-window 0` is the unchanged default. A positive window (at most 256) limits outstanding source records; the crop queue fills up to `--crop-batch-size` (at most 128 in this mode). A full crop batch, frame-window limit, byte limit, or end of input triggers a flush. Every source record remains in order, including empty detections; source records wait until all their crops finish. No temporal tracker is used. This option requires detector batch size 1 and is rejected for live/replay and staged archive commands.
+
+The byte budget (1–1024 MiB, default 256) covers retained RGB crops **and owned mask polygon arrays**. Crops still have source/context dimensions in this queue; Hydra resizes them to 512 pixels during preprocessing. Exact crop geometry and polygon bytes are checked before allocation, and an individually oversized crop fails explicitly. The current full source frame, current detector descriptors, model/intermediate tensors, native crop/preprocessing scratch, and partial output for one source plus decoded/output data for the active crop group are outside this queue budget; the process RSS guard still applies. Between flushes, FIFO completion leaves partial star output only for the leading unfinished source; later empty-source metadata is bounded by the frame window. Full source arrays and descriptor lists are released after ingesting each frame. Crops never go through a disk spool and models remain resident.
+
+`report.json` identifies `resident-cross-frame-crops`, queue peaks, flush reasons, and the observed crop-batch histogram. Buffered `source_group_latency` measures source ingestion and any flush it triggers, excluding the final EOF flush; it is **not per-image completion latency**. Throughput and whole-job timing include the final drain and cleanup. Warmup and measurement use separate buffers. Increasing the GRU group changes batch membership and can change GPU arithmetic; Hydra batch size 1 alone does not establish exact full-pipeline parity. Keep the existing strict output comparison and paired GPU measurements before selecting this schedule. This candidate has CPU scheduling/geometry tests, not a GPU speed or parity certification.
+
 Ordered archive decode is an opt-in candidate for `archive`, archive-mode `benchmark`, and `staged-archive`:
 
 ```bash
@@ -88,6 +103,38 @@ The report's `archive_decode` statistics separate summed worker decode time from
 For RunPod's SSH worker mode, set the container argument to `runpod-worker`, expose TCP port 22, and supply your SSH **public** key in `PUBLIC_KEY`. The same image starts OpenSSH with public-key authentication and password login disabled; `rsync` is included for workload transfer. Host keys are created at container startup. No cloud tokens or private SSH keys belong in the image. Ordinary Docker invocations continue to run the CLI.
 
 Use `--profile-stages` in a separate run for synchronized per-stage timings. Throughput runs omit it. Live replay measures processing of ordered files, including decoding and JSONL output; it does not simulate camera arrival, dropped-frame handling, or queue latency.
+
+## Compare two runs
+
+The `compare` command streams both prediction files through the fixed runtime parity gates. It needs neither a GPU nor model weights. It reports input-file SHA256 hashes, checked-frame counts, bounded issue details, numeric deviations, and the applied tolerances. Exit status is 0 only for a pass, 1 for a failed comparison or file/report error, and 2 for invalid arguments. `--output` is optional and must name a new file; the JSON report is also printed to stdout. Reports omit source paths and local exception text. Inputs must remain unchanged while comparison runs.
+
+```bash
+deepstarnoodles-inference compare \
+  --reference outputs/reference/predictions.jsonl \
+  --candidate outputs/candidate/predictions.jsonl \
+  --output outputs/comparison.json
+```
+
+For a paired decode experiment, reuse the **same immutable Docker image**, checkpoint manifest, input files and container paths in both runs. Preserve the image digest captured in the download example; do not resolve `latest` again between measurements. Keep detector/crop batches, warmup, CPU quota, and memory limits fixed:
+
+```bash
+IMAGE=$(cat image.txt)
+for WORKERS in 0 2; do
+  docker run --rm --gpus all --memory=32g --cpus=8 --shm-size=1g \
+    -v "$PWD/models:/models:ro" -v "$PWD/inputs:/inputs:ro" \
+    -v "$PWD/outputs:/outputs" "$IMAGE" \
+    archive --models /models --index /inputs/archive.csv \
+    --output "/outputs/paired-decode-$WORKERS" --images 128 --warmup 8 \
+    --detector-batch-size 1 --crop-batch-size 1 --decode-workers "$WORKERS" \
+    --decode-prefetch-frames 4 --decode-prefetch-mib 256 --decode-max-frame-mib 64
+done
+docker run --rm -v "$PWD/outputs:/outputs" "$IMAGE" compare \
+  --reference /outputs/paired-decode-0/predictions.jsonl \
+  --candidate /outputs/paired-decode-2/predictions.jsonl \
+  --output /outputs/paired-decode-parity.json
+```
+
+Prediction source paths must match, so mounting the same inputs at different paths intentionally fails the mapping gate. This command compares output records; independently verify matching input/model hashes and runtime settings in the run reports. A pass does not establish task accuracy, representative workload coverage, memory fit, or a speedup. Compare repeated timings in alternating order with new output directories after parity passes. Keep the gates fixed; inspect failed comparisons instead of widening tolerances after observing results. Issue counts count events rather than failed images, and maxima cover only records whose shapes/counts permit comparison.
 
 ## Camera, video, and ndarray input
 
