@@ -21,7 +21,8 @@
       "seed": 0,
       "checkpoint_bytes": 63454149,
       "checkpoint_parameters": 31373407,
-      "image_size": 1024
+      "image_size": 1024,
+      "url": "https://github.com/weertman/deepstarnoodles-inference/releases/download/models-seed0-20261028/starseg.pt"
     },
     "hydra": {
       "path": "hydra.pt",
@@ -35,7 +36,8 @@
       "output_channels": 18,
       "embedding_dim": 8,
       "image_size": 512,
-      "note": "The completed H0 training manifest specifies ConvNeXt-Base. A ConvNeXt-Large or ViT-L checkpoint is not substituted."
+      "note": "The completed H0 training manifest specifies ConvNeXt-Base. A ConvNeXt-Large or ViT-L checkpoint is not substituted.",
+      "url": "https://github.com/weertman/deepstarnoodles-inference/releases/download/models-seed0-20261028/hydra.pt"
     },
     "tracer": {
       "path": "tracer.pt",
@@ -53,7 +55,8 @@
       "trace_params_source": "checkpoint",
       "normalization_source": "checkpoint_buffers",
       "calibration_status": "unverified",
-      "calibration_note": "Use the checkpoint's stored trace parameters. No calibration from an older released tracer is authorized by this manifest."
+      "calibration_note": "Use the checkpoint's stored trace parameters. No calibration from an older released tracer is authorized by this manifest.",
+      "url": "https://github.com/weertman/deepstarnoodles-inference/releases/download/models-seed0-20261028/tracer.pt"
     }
   },
   "preprocessing": {

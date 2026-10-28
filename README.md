@@ -4,15 +4,51 @@ Portable StarSeg → Hydra → GRU128 inference for cameras, video files, live r
 
 The initial pinned generation uses YOLO26-L segmentation, **DINOv3 ConvNeXt-Base**, and a GRU with 128 hidden units. “128” is the arm-walker state width; the recurrence follows each arm within an image. Live replay adds BoT-SORT animal IDs and per-animal arm association. Archive images are independent. This package does not substitute a Large backbone for the trained Base checkpoint.
 
+## Download and run
+
+The trained checkpoints are published in [models-seed0-20261028](https://github.com/weertman/deepstarnoodles-inference/releases/tag/models-seed0-20261028). Download the manifest, then let the container fetch and SHA-256-verify all three files. This needs about 793 MB for the checkpoint files, plus the CUDA image.
+
+```bash
+mkdir -p deepstarnoodles-run
+cd deepstarnoodles-run
+curl -fL -o manifest.json \
+  https://github.com/weertman/deepstarnoodles-inference/releases/download/models-seed0-20261028/manifest.json
+
+# Pull the public image, then preserve its immutable digest.
+IMAGE=ghcr.io/weertman/deepstarnoodles-inference:latest
+docker pull "$IMAGE"
+# Save the immutable registry digest for subsequent runs.
+IMAGE=$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')
+printf '%s\n' "$IMAGE" > image.txt
+
+docker run --rm -v "$PWD:/work" "$IMAGE" \
+  fetch-models --models /work/manifest.json --destination /work/models
+```
+
+`models/` must not already exist. The download command verifies every file and writes a portable local manifest. Fetching weights needs no GPU; inference requires an NVIDIA driver and Docker GPU support.
+
+For an archive, put an `archive.csv` containing an `image_path` column in `inputs/`; paths resolve relative to that CSV. Start conservatively with one detector image and one crop per batch, then benchmark larger batches:
+
+```bash
+mkdir -p inputs outputs
+docker run --rm --gpus all --memory=32g --cpus=8 --shm-size=1g \
+  -v "$PWD/models:/models:ro" -v "$PWD/inputs:/inputs:ro" \
+  -v "$PWD/outputs:/outputs" "$IMAGE" \
+  archive --models /models --index /inputs/archive.csv \
+  --output /outputs/archive --detector-batch-size 1 --crop-batch-size 1
+```
+
+For a local camera, add `--device=/dev/video0:/dev/video0` to the Docker options and replace the final command with `live --models /models --camera 0 --output /outputs/camera --max-seconds 60`. Camera mode keeps one pending frame and reports dropped frames. `live --video /inputs/clip.mp4` processes a file sequentially. Each output directory must be new. The shipped defaults are reference settings; publication alone does not establish 8 GB fit or a live frame-rate guarantee.
+
 ## Docker
 
 Build from this directory. The version-pinned runtime is PyTorch 2.8.0, torchvision 0.23.0, CUDA 12.8, and Ultralytics 8.4.51. CUDA 12.8 is selected for the RTX 5060 target. An allocator cap on a larger GPU does not reproduce that GPU's performance or guarantee total VRAM fit.
 
 ```bash
-docker build -t deepstarnoodles-inference:0.2.0 .
+docker build -t deepstarnoodles-inference:0.2.1 .
 docker run --rm --gpus all --memory=32g --cpus=8 --shm-size=1g \
   -v "$PWD/models:/models:ro" -v "$PWD/inputs:/inputs:ro" \
-  -v "$PWD/outputs:/outputs" deepstarnoodles-inference:0.2.0 \
+  -v "$PWD/outputs:/outputs" deepstarnoodles-inference:0.2.1 \
   archive --models /models --index /inputs/archive.csv \
   --output /outputs/archive-b4 --images 128 --warmup 8 \
   --detector-batch-size 4 --crop-batch-size 4
@@ -82,7 +118,7 @@ Place three trusted checkpoints and `manifest.json` in `models/`. `config/manife
 deepstarnoodles-inference verify-models --models models/
 ```
 
-Model weights are not committed or baked into the image. If you have authorized HTTPS download URLs, add a `url` to each model record and explicitly run `fetch-models --models manifest.json --destination models`. It verifies SHA-256 and removes download URLs from the resulting manifest. There are no implicit downloads during inference.
+Model weights are public release assets and are not committed or baked into the image. The example manifest includes their pinned download URLs. Explicitly run `fetch-models --models config/manifest.seed0.example.json --destination models` to download and verify them. The destination must be new. The command removes download URLs from the resulting local manifest. There are no implicit downloads during inference.
 
 Input CSVs require an `image_path` column. Relative image paths resolve against the CSV directory; absolute paths are accepted. A historical archive can be arbitrarily ordered. Each live CSV must contain one chronological stream. Outputs are streamed to `predictions.jsonl` plus a `report.json` containing checkpoint hashes, hardware/runtime details, crop counts, timing, and memory peaks. Empty detections still receive a source record. Archive arms use `arm_index`; live arms use `track_id` scoped to their `star_track_id`.
 

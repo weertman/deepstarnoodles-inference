@@ -22,7 +22,8 @@ if [ "${1:-}" = "runpod-worker" ]; then
         -o PasswordAuthentication=no \
         -o KbdInteractiveAuthentication=no \
         -o PubkeyAuthentication=yes \
-        -o UsePAM=no
+        -o UsePAM=no \
+        -o SetEnv=PATH=/opt/conda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 fi
 
 exec deepstarnoodles-inference "$@"
