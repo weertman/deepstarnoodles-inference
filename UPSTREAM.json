@@ -1,0 +1,47 @@
+{
+  "repository": "https://github.com/weertman/DeepStarNoodles",
+  "vendored_at": "2026-10-28",
+  "files": [
+    {
+      "source": "CORE/deepstarnoodles/model.py",
+      "sha256": "d0a36bcf2cf15b09274eaa2d6096fe3e91909f166511a45726e8f5b52bbed223"
+    },
+    {
+      "source": "CORE/deepstarnoodles/hydra.py",
+      "sha256": "65a65504e9c0326ae8295590b7a4efb6c6dd9d6adfe1277acf48f3c9cb1f43cc"
+    },
+    {
+      "source": "CORE/deepstarnoodles/crop.py",
+      "sha256": "1776977aa1016ebd12dc9c15aba90ee7b524cf75d4bf301baf1789101701e5f8"
+    },
+    {
+      "source": "CORE/deepstarnoodles/noodle_tracer.py",
+      "sha256": "ac9ffcd2f251f7b3c0fac2c52b0ba977ac8bc7b4309255bcc4c474108e852730"
+    },
+    {
+      "source": "CORE/deepstarnoodles/decode.py",
+      "sha256": "71b787ea898a1aa433968b6056fa49fe25c15130f9e793c08cbc8953e97cb2c4"
+    },
+    {
+      "source": "CORE/deepstarnoodles/decode_embed.py",
+      "sha256": "30650f5c9488009583c1a0edd38a5b68577765839e0bbaf1ad4d45abd3f6df9c"
+    },
+    {
+      "source": "CORE/deepstarnoodles/temporal_quality.py",
+      "sha256": "4deee9b4e528c072bbade30f0c9d04e76a4c6a59ef111030cd5d1fbf6aeb2f0c"
+    },
+    {
+      "source": "CORE/deepstarnoodles/fused_tracker.py",
+      "sha256": "cbf4267655ffb9ee33f00f0b70769416e65b1f9b5bd99ad8868976ae2f276674"
+    },
+    {
+      "source": "CORE/deepstarnoodles/runtime.py",
+      "sha256": "cbdd1214bab456c2bce4821b1da1651b964fc1b84815adb3e0ec38edbdcf211b"
+    }
+  ],
+  "dinov3": {
+    "source": "external/dinov3/dinov3/models/convnext.py",
+    "sha256": "ab969325158df58f4b0957f81f77d543392df61611dc0c72e89ba172ecdf0fb9",
+    "note": "Unmodified runtime-only ConvNeXt implementation; no pretrained weights bundled."
+  }
+}
