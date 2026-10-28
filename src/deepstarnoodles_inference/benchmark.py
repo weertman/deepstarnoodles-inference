@@ -53,8 +53,16 @@ def parse_args(argv=None):
     p.add_argument("--profile-stages", action="store_true", help="Synchronize each stage; use separate runs for throughput")
     p.add_argument("--starseg-half", action="store_true")
     p.add_argument("--hydra-fp32", action="store_true")
+    p.add_argument("--hydra-output-mode", choices=("full", "minimal"), default="full",
+                   help="Experimental: skip unused activated fields; live tracking activates only support/mouth")
     p.add_argument("--channels-last", action="store_true", help="Experimental Hydra memory layout")
+    p.add_argument("--gru-execution", choices=("dynamic", "fixed"), default="dynamic",
+                   help="Experimental fixed mode keeps all seed slots; dynamic remains the reference")
+    p.add_argument("--gru-check-interval", type=int, default=8,
+                   help="Fixed mode checks aggregate termination every N steps (1-128); ignored by dynamic mode")
     args = p.parse_args(argv)
+    if not 1 <= args.gru_check_interval <= 128:
+        p.error("--gru-check-interval must be between 1 and 128")
     if min(args.images, args.detector_batch_size, args.crop_batch_size) < 1 or args.warmup < 0:
         p.error("image/batch counts must be positive and warmup non-negative")
     if args.mode == "live-replay" and args.detector_batch_size != 1:
@@ -201,9 +209,30 @@ class Cascade:
             frames = [cv2.imread(str(path), cv2.IMREAD_COLOR) for path in paths]
             if any(frame is None for frame in frames):
                 raise ValueError("could not decode one or more source images")
-        records = [{"frame": start_index + i, "image_path": str(path),
+        return self.run_frames(frames, start_index, timer, source_paths=paths)
+
+    def run_frames(self, frames, start_index, timer, *, source_paths=None):
+        """Process BGR uint8 arrays without file I/O; caller owns frame lifetime.
+
+        Temporal trackers age by processed observations. A dropping capture source
+        must supply a contiguous processed index here, and record its source
+        acquisition sequence separately.
+        """
+        if not frames:
+            raise ValueError("at least one source frame is required")
+        if self.live_cropper and len(frames) != 1:
+            raise ValueError("live replay must process exactly one source frame at a time")
+        for frame in frames:
+            if (not isinstance(frame, np.ndarray) or frame.dtype != np.uint8
+                    or frame.ndim != 3 or frame.shape[2] != 3 or min(frame.shape[:2]) < 1):
+                raise ValueError("source frames must be nonempty HxWx3 BGR uint8 arrays")
+        if source_paths is not None and len(source_paths) != len(frames):
+            raise ValueError("source_paths must match source frames")
+        frames = [np.ascontiguousarray(frame) for frame in frames]
+        records = [{"frame": start_index + i,
+                    "image_path": None if source_paths is None else str(source_paths[i]),
                     "source_shape": list(frame.shape[:2]), "stars": []}
-                   for i, (path, frame) in enumerate(zip(paths, frames))]
+                   for i, frame in enumerate(frames)]
         with timer.stage("starseg"):
             if self.live_cropper:
                 crops = self.live_cropper.track_crops(frames[0])
@@ -229,13 +258,26 @@ class Cascade:
                 if self.args.channels_last:
                     images = images.contiguous(memory_format=torch.channels_last)
             with timer.stage("hydra"):
-                raw, activated = self.hydra.predict_tensor_batch(images)
+                minimal = getattr(self.args, "hydra_output_mode", "full") == "minimal"
+                if minimal:
+                    raw = self.hydra.predict_tensor_batch_raw(images)
+                    activated = self.hydra.tracking_maps(raw) if self.live_cropper else None
+                else:
+                    raw, activated = self.hydra.predict_tensor_batch(images)
             with timer.stage("gru"):
-                decoded = trace_arms_noodle_batch(raw, images, self.tracer, self.trace_params)
+                if getattr(self.args, "gru_execution", "dynamic") == "fixed":
+                    from .noodle_tracer_fixed import trace_arms_noodle_batch_fixed_slots
+                    decoded = trace_arms_noodle_batch_fixed_slots(
+                        raw, images, self.tracer, self.trace_params,
+                        check_interval=getattr(self.args, "gru_check_interval", 8))
+                else:
+                    decoded = trace_arms_noodle_batch(raw, images, self.tracer, self.trace_params)
             with timer.stage("postprocess_track"):
                 for k, ((i, j, crop), arms) in enumerate(zip(crop_group, decoded)):
                     if self.live_cropper:
-                        labels = self.registry.track(crop.star_track_id, start_index + i, activated[k].cpu().numpy(), arms)
+                        tracking_options = {"support_mouth_only": True} if minimal else {}
+                        labels = self.registry.track(crop.star_track_id, start_index + i,
+                                                     activated[k].cpu().numpy(), arms, **tracking_options)
                     else:
                         labels = list(range(len(arms)))
                     arm_records = source_arm_records(arms, labels, crop, model_size=self.hydra.image_size)

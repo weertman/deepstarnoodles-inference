@@ -109,17 +109,58 @@ class HydraPredictor:
         return self.preprocess_batch([crop_rgb])
 
     @torch.no_grad()
-    def predict_tensor_batch(
+    def predict_tensor_batch_raw(
         self,
         images: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run an already-preprocessed ``(B,3,S,S)`` tensor."""
+    ) -> torch.Tensor:
+        """Return float32 raw fields without allocating activated fields.
+
+        The GRU consumes these raw fields directly. Archive inference does not
+        need the second dense tensor returned by :meth:`predict_tensor_batch`.
+        """
         if images.ndim != 4 or images.shape[1] != 3:
             raise ValueError("images must be (B,3,H,W)")
         image = images.to(self.device)
         use_amp = self.config.amp and self.device.type == "cuda"
         with torch.autocast(device_type=self.device.type, enabled=use_amp):
             raw = self.model(image).float()
+        # Retain the output-contract validation of the compatibility path.
+        output_slices(self.output_spec or self.model.output_spec, raw.shape[1])
+        return raw
+
+    @torch.no_grad()
+    def tracking_maps(self, raw: torch.Tensor) -> torch.Tensor:
+        """Activate only support and mouth, in that order, as ``(B,2,H,W)``.
+
+        Live arm association uses only these maps. Keep raw fields unchanged for
+        the GRU and avoid transferring embeddings or unused geometry to CPU.
+        """
+        if raw.ndim != 4:
+            raise ValueError("raw fields must be (B,C,H,W)")
+        geometry_slice, _ = output_slices(
+            self.output_spec or self.model.output_spec, raw.shape[1]
+        )
+        if geometry_slice != (0, 10):
+            raise ValueError("tracking maps require ten-channel Hydra geometry")
+        # Validated ten-channel geometry fixes arm_support=0 and mouth=5.
+        maps = torch.empty(
+            (raw.shape[0], 2, *raw.shape[-2:]), dtype=torch.float32, device=raw.device
+        )
+        torch.sigmoid(raw[:, 0], out=maps[:, 0])
+        torch.sigmoid(raw[:, 5], out=maps[:, 1])
+        return maps
+
+    @torch.no_grad()
+    def predict_tensor_batch(
+        self,
+        images: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run ``(B,3,S,S)`` input and return raw plus full activated fields.
+
+        This compatibility API retains its original shapes and return value.
+        Use :meth:`predict_tensor_batch_raw` when activations are unnecessary.
+        """
+        raw = self.predict_tensor_batch_raw(images)
         spec = self.output_spec or self.model.output_spec
         geometry_slice, embedding_slice = output_slices(spec, raw.shape[1])
         activated = torch.stack(

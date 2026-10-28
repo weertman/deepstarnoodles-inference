@@ -19,14 +19,19 @@ DEFAULT_STAR_TRACK_MAX_AGE = 30
 
 
 def body_center(activated: np.ndarray) -> np.ndarray:
-    mouth = find_peaks(activated[5], threshold=0.15, nms_radius=8)
+    return body_center_from_maps(activated[0], activated[5])
+
+
+def body_center_from_maps(support_map: np.ndarray, mouth_map: np.ndarray) -> np.ndarray:
+    """Find the same body center from the two maps needed by arm association."""
+    mouth = find_peaks(mouth_map, threshold=0.15, nms_radius=8)
     if len(mouth):
         return mouth[0, :2].astype(np.float32)
-    support = activated[0] > 0.3
+    support = support_map > 0.3
     ys, xs = np.nonzero(support)
     if len(xs):
         return np.asarray([xs.mean(), ys.mean()], dtype=np.float32)
-    height, width = activated.shape[-2:]
+    height, width = support_map.shape[-2:]
     return np.asarray([width / 2.0, height / 2.0], dtype=np.float32)
 
 
@@ -35,10 +40,15 @@ def track_arms(
     frame_index: int,
     activated: np.ndarray,
     arms: list[dict],
+    *,
+    support_mouth_only: bool = False,
 ) -> list[int]:
     if not arms:
         return []
-    center = body_center(activated)
+    if support_mouth_only and (activated.ndim != 3 or activated.shape[0] != 2):
+        raise ValueError("compact tracking maps must be (2,H,W): support, mouth")
+    center = (body_center_from_maps(activated[0], activated[1])
+              if support_mouth_only else body_center(activated))
     sampled: list[np.ndarray] = []
     lengths: list[float] = []
     identities: list[np.ndarray] = []
@@ -101,7 +111,10 @@ class StarArmTrackerRegistry:
         frame_index: int,
         activated: np.ndarray,
         arms: list[dict],
+        *,
+        support_mouth_only: bool = False,
     ) -> list[int]:
+        """Associate arms using full activations or explicit support/mouth maps."""
         star_track_id = int(star_track_id)
         frame_index = int(frame_index)
         previous_frame = self._last_seen.get(star_track_id)
@@ -114,7 +127,8 @@ class StarArmTrackerRegistry:
             tracker = self._tracker_factory()
             self._trackers[star_track_id] = tracker
         self._last_seen[star_track_id] = frame_index
-        return track_arms(tracker, frame_index, activated, arms)
+        return track_arms(tracker, frame_index, activated, arms,
+                          support_mouth_only=support_mouth_only)
 
     def prune(self, frame_index: int) -> None:
         frame_index = int(frame_index)

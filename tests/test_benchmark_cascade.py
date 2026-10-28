@@ -41,8 +41,14 @@ class Hydra:
         return torch.zeros(len(crops), 3, 16, 16)
 
     def predict_tensor_batch(self, images):
-        fields = torch.zeros(len(images), 18, 16, 16)
+        fields = self.predict_tensor_batch_raw(images)
         return fields, fields
+
+    def predict_tensor_batch_raw(self, images):
+        return torch.zeros(len(images), 18, 16, 16)
+
+    def tracking_maps(self, raw):
+        return raw[:, (0, 5)]
 
 
 def make_pipeline(monkeypatch, *, detector_batch=3, crop_batch=2):
@@ -85,10 +91,16 @@ def write_images(tmp_path: Path, count=4):
     return paths, index
 
 
-def test_archive_detects_crops_all_stars_without_temporal_tracking(tmp_path, monkeypatch):
+@pytest.mark.parametrize("hydra_output_mode", ["full", "minimal"])
+def test_archive_detects_crops_all_stars_without_temporal_tracking(tmp_path, monkeypatch, hydra_output_mode):
     paths, index = write_images(tmp_path)
     pipeline = make_pipeline(monkeypatch)
     pipeline.args.index = index
+    pipeline.args.hydra_output_mode = hydra_output_mode
+    if hydra_output_mode == "minimal":
+        def forbidden(_images):
+            raise AssertionError("archive minimal mode must not request full activations")
+        pipeline.hydra.predict_tensor_batch = forbidden
 
     class ForbiddenRegistry:
         def __getattr__(self, name):
@@ -132,10 +144,12 @@ def test_archive_detects_crops_all_stars_without_temporal_tracking(tmp_path, mon
     assert all(star["star_track_id"] is None for record in records for star in record["stars"])
 
 
-def test_live_replay_tracks_each_frame_before_reading_next_and_resets(tmp_path, monkeypatch):
+@pytest.mark.parametrize("hydra_output_mode", ["full", "minimal"])
+def test_live_replay_tracks_each_frame_before_reading_next_and_resets(tmp_path, monkeypatch, hydra_output_mode):
     paths, index = write_images(tmp_path, count=2)
     pipeline = make_pipeline(monkeypatch, detector_batch=1)
     pipeline.args.index = index
+    pipeline.args.hydra_output_mode = hydra_output_mode
     events = []
     imread = cv2.imread
 
@@ -155,7 +169,9 @@ def test_live_replay_tracks_each_frame_before_reading_next_and_resets(tmp_path, 
             events.append(("reset_cropper",))
 
     class Registry:
-        def track(self, star, frame, _activated, arms):
+        def track(self, star, frame, _activated, arms, **kwargs):
+            assert _activated.shape[0] == (2 if hydra_output_mode == "minimal" else 18)
+            assert kwargs == ({"support_mouth_only": True} if hydra_output_mode == "minimal" else {})
             events.append(("track", star, frame))
             return [42] * len(arms)
 
@@ -220,7 +236,8 @@ def test_cascade_forwards_same_detector_geometry_and_precision(mode, tmp_path, m
 
 
 @pytest.mark.parametrize("fail_measurement", [False, True])
-def test_main_separates_warmup_resets_state_and_records_outcome(tmp_path, monkeypatch, fail_measurement):
+@pytest.mark.parametrize("gru_execution", ["dynamic", "fixed"])
+def test_main_separates_warmup_resets_state_and_records_outcome(tmp_path, monkeypatch, fail_measurement, gru_execution):
     _, index = write_images(tmp_path, count=2)
     manifest = tmp_path / "models.json"
     models = {}
@@ -254,7 +271,8 @@ def test_main_separates_warmup_resets_state_and_records_outcome(tmp_path, monkey
     monkeypatch.setattr(benchmark, "Cascade", Pipeline)
     output = tmp_path / "output"
     argv = ["--models", str(manifest), "--index", str(index), "--output", str(output),
-            "--mode", "live-replay", "--device", "cpu", "--images", "2", "--warmup", "1"]
+            "--mode", "live-replay", "--device", "cpu", "--images", "2", "--warmup", "1",
+            "--gru-execution", gru_execution, "--gru-check-interval", "4"]
     if fail_measurement:
         with pytest.raises(RuntimeError, match="mock inference failed"):
             benchmark.main(argv)
@@ -266,6 +284,8 @@ def test_main_separates_warmup_resets_state_and_records_outcome(tmp_path, monkey
     assert len(report["input_files"]) == 2
     assert all(item["sha256"] == benchmark.sha256(item["path"]) for item in report["input_files"])
     assert report["status"] == ("failed" if fail_measurement else "complete")
+    assert report["configuration"]["gru_execution"] == gru_execution
+    assert report["configuration"]["gru_check_interval"] == 4
     if fail_measurement:
         assert report["error"] == "RuntimeError: mock inference failed"
     else:

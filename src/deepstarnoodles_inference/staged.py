@@ -106,7 +106,11 @@ def run_shard(args, model_paths, paths, frame_start, spool, timer, state):
             images = hydra.preprocess_batch(crops).to(timer.device)
             if args.channels_last:
                 images = images.contiguous(memory_format=torch.channels_last)
-            raw, activated = hydra.predict_tensor_batch(images)
+            if getattr(args, "hydra_output_mode", "full") == "minimal":
+                raw = hydra.predict_tensor_batch_raw(images)
+                activated = None
+            else:
+                raw, activated = hydra.predict_tensor_batch(images)
             raw_cpu, images_cpu = raw.cpu().numpy(), images.cpu().numpy()
             for entry, fields, image in zip(group, raw_cpu, images_cpu):
                 save_array(spool / f"{entry['stem']}_raw.npy", fields, state, args)
@@ -127,7 +131,13 @@ def run_shard(args, model_paths, paths, frame_start, spool, timer, state):
         for group in b.chunks(entries, args.crop_batch_size):
             raws = torch.from_numpy(np.stack([np.load(spool / f"{e['stem']}_raw.npy", allow_pickle=False) for e in group])).to(timer.device)
             images = torch.from_numpy(np.stack([np.load(spool / f"{e['stem']}_image.npy", allow_pickle=False) for e in group])).to(timer.device)
-            decoded = trace_arms_noodle_batch(raws, images, tracer, trace_params)
+            if getattr(args, "gru_execution", "dynamic") == "fixed":
+                from .noodle_tracer_fixed import trace_arms_noodle_batch_fixed_slots
+                decoded = trace_arms_noodle_batch_fixed_slots(
+                    raws, images, tracer, trace_params,
+                    check_interval=getattr(args, "gru_check_interval", 8))
+            else:
+                decoded = trace_arms_noodle_batch(raws, images, tracer, trace_params)
             for entry, arms in zip(group, decoded):
                 c = entry["crop"]
                 crop = SimpleNamespace(crop_side=c["side"], crop_left=c["left"], crop_top=c["top"])

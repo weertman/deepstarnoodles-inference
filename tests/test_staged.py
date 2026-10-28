@@ -18,6 +18,7 @@ import ultralytics
 
 from deepstarnoodles_inference import benchmark as b
 from deepstarnoodles_inference import staged
+from deepstarnoodles_inference import noodle_tracer_fixed
 from deepstarnoodles_inference.hydra import HydraPredictor as RealHydraPredictor
 
 
@@ -47,7 +48,8 @@ def frames(tmp_path):
 @pytest.fixture
 def fake_models(monkeypatch):
     witness = SimpleNamespace(events=[], detector_refs=[], result_refs=[], hydra_refs=[],
-                              tracer_refs=[], traced_centers=[], enforce_exclusive=True)
+                              tracer_refs=[], traced_centers=[], enforce_exclusive=True,
+                              forbid_full_activations=False, fixed_intervals=[])
 
     def assert_released(refs, stage):
         if witness.enforce_exclusive:
@@ -107,10 +109,15 @@ def fake_models(monkeypatch):
             self.model = torch.nn.Identity()
 
         def predict_tensor_batch(self, images):
+            assert not witness.forbid_full_activations, "minimal archive must not request full activations"
+            raw = self.predict_tensor_batch_raw(images)
+            return raw, raw + 1.0
+
+        def predict_tensor_batch_raw(self, images):
             witness.events.append(("hydra_forward", len(images)))
             raw = images[:, :1] + 0.125
             raw._model_owner = self
-            return raw, raw + 1.0
+            return raw
 
     class Tracer:
         hidden_size = 128
@@ -139,6 +146,10 @@ def fake_models(monkeypatch):
         return answer
 
     monkeypatch.setattr(ultralytics, "YOLO", Detector)
+    def fixed(raw, images, tracer, params, *, check_interval):
+        witness.fixed_intervals.append(check_interval)
+        return trace(raw, images, tracer, params)
+    monkeypatch.setattr(noodle_tracer_fixed, "trace_arms_noodle_batch_fixed_slots", fixed)
     for module in (staged, b):
         monkeypatch.setattr(module, "HydraPredictor", Hydra)
         monkeypatch.setattr(module, "load_noodle_tracer_checkpoint", load_tracer)
@@ -152,10 +163,14 @@ def model_paths():
 
 
 @pytest.mark.parametrize("crop_batch_size", [1, 2, 4])
+@pytest.mark.parametrize("hydra_output_mode", ["full", "minimal"])
+@pytest.mark.parametrize("gru_execution", ["dynamic", "fixed"])
 def test_staged_matches_resident_archive_and_releases_each_model(
-    tmp_path, frames, fake_models, model_paths, crop_batch_size
+    tmp_path, frames, fake_models, model_paths, crop_batch_size, hydra_output_mode, gru_execution
 ):
-    args = arguments(crop_batch_size=crop_batch_size)
+    args = arguments(crop_batch_size=crop_batch_size, hydra_output_mode=hydra_output_mode,
+                     gru_execution=gru_execution, gru_check_interval=4)
+    fake_models.forbid_full_activations = hydra_output_mode == "minimal"
     state = spool_state()
     spool = tmp_path / "spool"
     spool.mkdir()
@@ -176,8 +191,11 @@ def test_staged_matches_resident_archive_and_releases_each_model(
     gc.collect()
     assert all(ref() is None for ref in fake_models.detector_refs + fake_models.hydra_refs + fake_models.tracer_refs)
     assert fake_models.traced_centers[0] == pytest.approx((71 / 255, 61 / 255, 51 / 255))
+    assert fake_models.fixed_intervals == ([4] * ((3 + crop_batch_size - 1) // crop_batch_size)
+                                          if gru_execution == "fixed" else [])
 
     fake_models.enforce_exclusive = False
+    args.gru_execution = "dynamic"
     resident = b.Cascade(args, model_paths)
     expected, expected_crops, expected_arms = [], 0, 0
     for group in b.chunks(frames, args.detector_batch_size):
@@ -243,14 +261,18 @@ def write_cli_inputs(tmp_path, frames):
     return argv, output
 
 
-def test_main_streams_multiple_shards_and_removes_intermediates(tmp_path, frames, fake_models):
+@pytest.mark.parametrize("gru_execution", ["dynamic", "fixed"])
+def test_main_streams_multiple_shards_and_removes_intermediates(tmp_path, frames, fake_models, gru_execution):
     argv, output = write_cli_inputs(tmp_path, frames)
+    argv += ["--gru-execution", gru_execution, "--gru-check-interval", "4"]
     assert staged.main(argv) == 0
     records = [json.loads(line) for line in (output / "predictions.jsonl").read_text().splitlines()]
     assert [record["frame"] for record in records] == [0, 1, 2]
     assert [len(record["stars"]) for record in records] == [2, 1, 0]
     report = json.loads((output / "report.json").read_text())
     assert report["status"] == "complete"
+    assert report["configuration"]["gru_execution"] == gru_execution
+    assert report["configuration"]["gru_check_interval"] == 4
     assert report["measurement"]["source_images"] == 3
     assert report["measurement"]["star_crops"] == 3
     assert report["measurement"]["empty_source_images"] == 1
