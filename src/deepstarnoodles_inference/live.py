@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from .benchmark import Cascade, Timer, host_peak_bytes, sha256, verify_models
+from .hydra import validate_hydra_batch_size
 
 
 @dataclass(frozen=True)
@@ -40,8 +41,10 @@ class LiveConfig:
     hydra_output_mode: str = "full"
     gru_execution: str = "dynamic"
     gru_check_interval: int = 8
+    hydra_batch_size: int | None = None
 
     def __post_init__(self):
+        validate_hydra_batch_size(self.hydra_batch_size)
         if isinstance(self.crop_batch_size, bool) or not isinstance(self.crop_batch_size, int) or self.crop_batch_size < 1:
             raise ValueError("crop_batch_size must be a positive integer")
         for name in ("allocator_limit_gib", "ram_limit_gib"):
@@ -409,6 +412,8 @@ def parse_args(argv=None):
     parser.add_argument("--max-seconds", type=float, help="Capture-run deadline, checked between reads/inference")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--crop-batch-size", type=int, default=1)
+    parser.add_argument("--hydra-batch-size", type=int, default=None,
+                        help="Experimental: cap Hydra forwards independently of the GRU crop batch")
     parser.add_argument("--allocator-limit-gib", type=float, default=7.0)
     parser.add_argument("--ram-limit-gib", type=float, default=24.0)
     parser.add_argument("--starseg-half", action="store_true")

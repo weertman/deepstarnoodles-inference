@@ -39,6 +39,66 @@ class HydraInferConfig:
     amp: bool = True
 
 
+def validate_hydra_batch_size(value: int | None) -> None:
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+        raise ValueError("hydra_batch_size must be a positive integer or None")
+
+
+@torch.no_grad()
+def predict_hydra_crops(
+    predictor,
+    images: torch.Tensor,
+    *,
+    batch_size: int | None = None,
+    minimal: bool = False,
+    tracking: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Run bounded Hydra forwards, retaining the full ordered GRU crop group.
+
+    None preserves one Hydra forward for the entire input. Explicit chunking
+    changes only Hydra's forward batch size, never the subsequent GRU batch.
+    Singleton forwards can help localize batch-dependent numerical drift; this
+    does not guarantee GPU parity or lower peak memory. Assemble directly into
+    output buffers to avoid retaining all chunks plus a second concatenation.
+    The public predictor methods retain their existing behavior.
+    """
+    validate_hydra_batch_size(batch_size)
+    if images.ndim != 4 or images.shape[1] != 3 or len(images) < 1:
+        raise ValueError("images must be nonempty (B,3,H,W)")
+
+    def forward(part):
+        if minimal:
+            raw = predictor.predict_tensor_batch_raw(part)
+            return raw, predictor.tracking_maps(raw) if tracking else None
+        return predictor.predict_tensor_batch(part)
+
+    if batch_size is None or batch_size >= len(images):
+        return forward(images)
+
+    def allocate_output(part):
+        # Preserve channels-last outputs so a Hydra batch cap does not also
+        # change the GRU's dense-input layout. Raw and activated maps may use
+        # different layouts (especially compact tracking maps).
+        layout = (torch.channels_last if part.is_contiguous(memory_format=torch.channels_last)
+                  else torch.contiguous_format)
+        return torch.empty((len(images), *part.shape[1:]), dtype=part.dtype,
+                           device=part.device, memory_format=layout)
+
+    raw_out = activated_out = None
+    for start in range(0, len(images), batch_size):
+        stop = min(start + batch_size, len(images))
+        raw, activated = forward(images[start:stop])
+        if raw_out is None:
+            raw_out = allocate_output(raw)
+            if activated is not None:
+                activated_out = allocate_output(activated)
+        raw_out[start:stop].copy_(raw)
+        if activated is not None:
+            activated_out[start:stop].copy_(activated)
+        del raw, activated
+    return raw_out, activated_out
+
+
 class HydraPredictor:
     """Single-checkpoint dense predictor that preserves embedding channels.
 

@@ -45,13 +45,13 @@ For a local camera, add `--device=/dev/video0:/dev/video0` to the Docker options
 Build from this directory. The version-pinned runtime is PyTorch 2.8.0, torchvision 0.23.0, CUDA 12.8, and Ultralytics 8.4.51. CUDA 12.8 is selected for the RTX 5060 target. An allocator cap on a larger GPU does not reproduce that GPU's performance or guarantee total VRAM fit.
 
 ```bash
-docker build -t deepstarnoodles-inference:0.2.1 .
+docker build -t deepstarnoodles-inference:0.3.0 .
 docker run --rm --gpus all --memory=32g --cpus=8 --shm-size=1g \
   -v "$PWD/models:/models:ro" -v "$PWD/inputs:/inputs:ro" \
-  -v "$PWD/outputs:/outputs" deepstarnoodles-inference:0.2.1 \
+  -v "$PWD/outputs:/outputs" deepstarnoodles-inference:0.3.0 \
   archive --models /models --index /inputs/archive.csv \
-  --output /outputs/archive-b4 --images 128 --warmup 8 \
-  --detector-batch-size 4 --crop-batch-size 4
+  --output /outputs/archive-reference --images 128 --warmup 8 \
+  --detector-batch-size 1 --crop-batch-size 1
 ```
 
 For one ordered stream, replace `archive` with `live-replay`, select its chronological CSV, and use `--detector-batch-size 1`. Crop micro-batches may combine animals in the same frame; frames stay causal. Start a separate command for each clip so tracker state resets. Output directories must be new.
@@ -60,15 +60,30 @@ For one ordered stream, replace `archive` with `live-replay`, select its chronol
 
 `--hydra-output-mode minimal` is an opt-in memory candidate for all three commands and `staged-archive`. Archives skip the unused activated Hydra output; live replay activates and transfers only support and mouth maps for arm association. The default is `full`. Raw GRU inputs and tracking thresholds are unchanged. For 512-pixel float32 outputs, this removes an 18 MiB activation tensor per crop in archive mode and replaces it with 2 MiB per crop in live mode; actual peak VRAM and speed still require GPU measurement. The Python `predict_tensor_batch` API continues to return raw and full activated fields.
 
+`--hydra-batch-size 1 --crop-batch-size 4` runs Hydra separately for each crop, then passes the ordered group of up to four crops to the GRU. This experimental option is available in archive, live replay, camera/video, and staged archive commands; the Python API uses `LiveConfig(hydra_batch_size=1, crop_batch_size=4)`. Omitting it preserves the current shared crop batch size. A positive value caps only Hydra forwards and may be combined with either Hydra output mode or GRU decoder. This can isolate dense-model batch effects; it does not guarantee parity, higher speed, or lower peak VRAM. Outputs still retain the full GRU crop group. Measure unchanged parity gates and target-GPU latency, throughput, and memory before selecting it.
+
 `staged-archive` is the disk-spooled archive candidate: it runs the detector and dense/tracer stages separately to reduce simultaneous model residency. See `deepstarnoodles-inference staged-archive --help` for its arguments. Compare its whole-job time and spool storage with the resident archive path.
 
 ```bash
 deepstarnoodles-inference staged-archive --models models/ --index inputs/archive.csv \
-  --output outputs/staged --images 128 --detector-batch-size 4 --crop-batch-size 4 \
+  --output outputs/staged --images 128 --detector-batch-size 1 --crop-batch-size 1 \
   --shard-size 32 --max-spool-gib 8
 ```
 
 `--shard-size` bounds the number of source images processed before reloading stages; `--max-spool-gib` bounds live intermediate files and stops the run if exceeded. Stage initialization and spool I/O are included in job time. Staged archive defaults to archive mode with zero warmup; its default image limit is 128, so set `--images` explicitly for a full workload.
+
+Ordered archive decode is an opt-in candidate for `archive`, archive-mode `benchmark`, and `staged-archive`:
+
+```bash
+deepstarnoodles-inference archive --models models/ --index inputs/archive.csv \
+  --output outputs/prefetch --detector-batch-size 1 --crop-batch-size 1 \
+  --decode-workers 2 --decode-prefetch-frames 4 \
+  --decode-prefetch-mib 256 --decode-max-frame-mib 64
+```
+
+`--decode-workers 0` keeps synchronous decoding; supported worker counts are 1, 2, and 4. Workers read immutable files with the same OpenCV BGR decoder and yield every image in source order, preserving detector batches and their final remainder. The queue reserves decoded-array bytes from image headers before submitting jobs. It rejects frames larger than `--decode-max-frame-mib`; choose a limit large enough for your largest image. Reservations cover reader-owned queued and inflight decoded arrays, **not** the current consumer batch, native codec scratch, compressed buffers, or filesystem cache. `--decode-prefetch-frames` (at most 64) and `--decode-prefetch-mib` (at most 1024) bound extra retained work; the process RSS guard still applies. Staged decoding closes its queue before loading Hydra and reports aggregate queue statistics across shards.
+
+The report's `archive_decode` statistics separate summed worker decode time from consumer wait. Profiling calls the wait stage `archive_decode_wait`; overlapping worker time is not a serial pipeline stage. Startup, drain, and worker cleanup are included in measurement and total job time. No frames are prefetched beyond the selected CSV rows, and warmup gets a separate reader. Native filesystem or decoder calls cannot be forcibly cancelled by Python threads, so a process deadline remains necessary for a blocked input. Benchmark input hashing warms the cache; this does not establish cold-storage performance. Compare identical model batches and output parity with workers 0, 1, 2, and 4 under the same CPU quota before enabling prefetch in deployment. It is archive-only and does not change camera/replay behavior.
 
 For RunPod's SSH worker mode, set the container argument to `runpod-worker`, expose TCP port 22, and supply your SSH **public** key in `PUBLIC_KEY`. The same image starts OpenSSH with public-key authentication and password login disabled; `rsync` is included for workload transfer. Host keys are created at container startup. No cloud tokens or private SSH keys belong in the image. Ordinary Docker invocations continue to run the CLI.
 

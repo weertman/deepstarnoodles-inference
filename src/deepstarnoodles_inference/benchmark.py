@@ -28,11 +28,12 @@ import cv2
 import numpy as np
 import torch
 
+from deepstarnoodles_inference.archive_decode import ArchiveSourceGroups
 from deepstarnoodles_inference.crop import (
     CropConfig, TrackedStarCropper, _crop_result, _result_detections,
     _sunflower_class_ids,
 )
-from deepstarnoodles_inference.hydra import HydraInferConfig, HydraPredictor
+from deepstarnoodles_inference.hydra import HydraInferConfig, HydraPredictor, predict_hydra_crops
 from deepstarnoodles_inference.noodle_tracer import load_noodle_tracer_checkpoint, trace_arms_noodle_batch
 from deepstarnoodles_inference.runtime import StarArmTrackerRegistry, crop_record, source_arm_records
 
@@ -48,6 +49,16 @@ def parse_args(argv=None):
     p.add_argument("--warmup", type=int, default=8, help="First N inputs, replayed separately before measurement")
     p.add_argument("--detector-batch-size", type=int, default=1)
     p.add_argument("--crop-batch-size", type=int, default=1)
+    p.add_argument("--hydra-batch-size", type=int, default=None,
+                   help="Experimental: cap Hydra forward batch independently of the GRU crop batch; omitted uses the full crop batch")
+    p.add_argument("--decode-workers", type=int, choices=(0, 1, 2, 4), default=0,
+                   help="Experimental archive-only ordered decode workers; 0 preserves synchronous decode")
+    p.add_argument("--decode-prefetch-frames", type=int, default=4,
+                   help="Maximum reader-owned queued/inflight frames (workers through 64)")
+    p.add_argument("--decode-prefetch-mib", type=int, default=256,
+                   help="Decoded-array reservation budget in MiB, excluding consumer batch and codec scratch (1-1024)")
+    p.add_argument("--decode-max-frame-mib", type=int, default=64,
+                   help="Reject larger decoded frames from their headers before decode when workers are enabled")
     p.add_argument("--allocator-limit-gib", type=float, default=7.0, help="PyTorch allocator guard only; not total VRAM or GPU emulation")
     p.add_argument("--ram-limit-gib", type=float, default=24.0, help="Fail when sampled process high-water RSS exceeds this budget")
     p.add_argument("--profile-stages", action="store_true", help="Synchronize each stage; use separate runs for throughput")
@@ -65,6 +76,15 @@ def parse_args(argv=None):
         p.error("--gru-check-interval must be between 1 and 128")
     if min(args.images, args.detector_batch_size, args.crop_batch_size) < 1 or args.warmup < 0:
         p.error("image/batch counts must be positive and warmup non-negative")
+    if args.hydra_batch_size is not None and args.hydra_batch_size < 1:
+        p.error("--hydra-batch-size must be positive")
+    if (not 1 <= args.decode_prefetch_frames <= 64
+            or args.decode_prefetch_frames < args.decode_workers
+            or not 1 <= args.decode_prefetch_mib <= 1024
+            or not 1 <= args.decode_max_frame_mib <= args.decode_prefetch_mib):
+        p.error("decode queue requires workers <= prefetch frames <= 64 and 1 <= max-frame MiB <= prefetch MiB <= 1024")
+    if args.mode != "archive" and args.decode_workers:
+        p.error("--decode-workers is archive-only; live replay keeps synchronous ordered input")
     if args.mode == "live-replay" and args.detector_batch_size != 1:
         p.error("live replay requires --detector-batch-size 1")
     if not (np.isfinite(args.allocator_limit_gib) and args.allocator_limit_gib > 0
@@ -259,11 +279,9 @@ class Cascade:
                     images = images.contiguous(memory_format=torch.channels_last)
             with timer.stage("hydra"):
                 minimal = getattr(self.args, "hydra_output_mode", "full") == "minimal"
-                if minimal:
-                    raw = self.hydra.predict_tensor_batch_raw(images)
-                    activated = self.hydra.tracking_maps(raw) if self.live_cropper else None
-                else:
-                    raw, activated = self.hydra.predict_tensor_batch(images)
+                raw, activated = predict_hydra_crops(
+                    self.hydra, images, batch_size=getattr(self.args, "hydra_batch_size", None),
+                    minimal=minimal, tracking=self.live_cropper is not None)
             with timer.stage("gru"):
                 if getattr(self.args, "gru_execution", "dynamic") == "fixed":
                     from .noodle_tracer_fixed import trace_arms_noodle_batch_fixed_slots
@@ -305,22 +323,31 @@ def measure(pipeline, args, count, sink, profile):
     groups_ms, source_count, crop_count, arm_count, empty_count = [], 0, 0, 0, 0
     timer.sync()
     run_start = time.perf_counter()
-    for paths in chunks(input_paths(args.index, count), args.detector_batch_size):
-        timer.sync()
-        start = time.perf_counter()
-        records, crops, arms = pipeline.run_group(paths, source_count, timer)
-        with timer.stage("serialize_write"):
-            for record in records:
-                sink.write(json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n")
-            sink.flush()
-        timer.sync()
-        groups_ms.append((time.perf_counter() - start) * 1000)
-        source_count += len(paths)
-        crop_count += crops
-        arm_count += arms
-        empty_count += sum(not record["stars"] for record in records)
-        if host_peak_bytes() > args.ram_limit_gib * 1024**3:
-            raise MemoryError("process high-water RSS exceeded --ram-limit-gib")
+    with ArchiveSourceGroups(input_paths(args.index, count), args.detector_batch_size, args, timer) as source:
+        while True:
+            timer.sync()
+            start = time.perf_counter()
+            try:
+                paths, frames = next(source)
+            except StopIteration:
+                break
+            if frames is None:
+                records, crops, arms = pipeline.run_group(paths, source_count, timer)
+            else:
+                records, crops, arms = pipeline.run_frames(frames, source_count, timer, source_paths=paths)
+                del frames
+            with timer.stage("serialize_write"):
+                for record in records:
+                    sink.write(json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n")
+                sink.flush()
+            timer.sync()
+            groups_ms.append((time.perf_counter() - start) * 1000)
+            source_count += len(paths)
+            crop_count += crops
+            arm_count += arms
+            empty_count += sum(not record["stars"] for record in records)
+            if host_peak_bytes() > args.ram_limit_gib * 1024**3:
+                raise MemoryError("process high-water RSS exceeded --ram-limit-gib")
     elapsed = time.perf_counter() - run_start
     if source_count != count:
         raise ValueError(f"requested {count} images but input CSV supplied {source_count}")
@@ -329,7 +356,8 @@ def measure(pipeline, args, count, sink, profile):
             "source_images_per_second": source_count / elapsed if elapsed else None,
             "star_crops_per_second": crop_count / elapsed if elapsed else None,
             "source_group_latency": summary(groups_ms), "group_ms": groups_ms,
-            "stages": {k: summary(v) for k, v in timer.values.items()}}
+            "stages": {k: summary(v) for k, v in timer.values.items()},
+            "archive_decode": source.report()}
 
 
 def main(argv=None):
@@ -358,6 +386,7 @@ def main(argv=None):
               "scope": "resident cascade; image files -> serialized JSONL; no overlay; inputs prehashed before timing",
               "limitations": ["Live replay excludes camera arrival/queue latency and does not establish a live FPS SLA.",
                               "Stage profiling inserts synchronizations; compare throughput with profiling disabled.",
+                              "Archive decode workers overlap inference; queue wait and summed worker decode are not additive serial stages. Decode reservations exclude consumer batches, codec scratch and page cache.",
                               "PyTorch peaks exclude external allocations. RSS is process high-water including load/warmup.",
                               "Allocator guard does not emulate RTX 5060 performance or certify total 8GB VRAM fit.",
                               "JSONL flush reaches the OS page cache; fsync/storage durability latency is excluded.",

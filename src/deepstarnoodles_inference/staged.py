@@ -19,8 +19,9 @@ import numpy as np
 import torch
 
 from . import benchmark as b
+from .archive_decode import ArchiveSourceGroups, accumulate_decode_report
 from .crop import CropConfig, _crop_result, _result_detections, _sunflower_class_ids
-from .hydra import HydraInferConfig, HydraPredictor
+from .hydra import HydraInferConfig, HydraPredictor, predict_hydra_crops
 from .noodle_tracer import load_noodle_tracer_checkpoint, trace_arms_noodle_batch
 from .runtime import crop_record, source_arm_records
 
@@ -70,25 +71,33 @@ def run_shard(args, model_paths, paths, frame_start, spool, timer, state):
     with timer.stage("detector_load_detect_crop_spool"):
         detector = YOLO(str(model_paths["starseg"]))
         ids = _sunflower_class_ids(detector)
-        for source_group in b.chunks(enumerate(paths), args.detector_batch_size):
-            frames = [cv2.imread(str(path), cv2.IMREAD_COLOR) for _, path in source_group]
-            if any(frame is None for frame in frames):
-                raise ValueError("could not decode source image")
-            predictions = detector.predict(frames, imgsz=cfg.imgsz, conf=cfg.conf,
-                iou=cfg.iou, device=args.device, half=args.starseg_half, rect=False, verbose=False)
-            for (source, path), frame, prediction in zip(source_group, frames, predictions):
-                records.append({"frame": frame_start + source, "image_path": str(path),
-                                "source_shape": list(frame.shape[:2]), "stars": []})
-                for detection_index, detection in enumerate(_result_detections(prediction, ids, require_track_ids=False)):
-                    crop = _crop_result(frame, detection, context_scale=cfg.context_scale)
-                    stem = str(len(entries))
-                    crop_path = spool / f"{stem}_crop.npy"
-                    save_array(crop_path, crop.crop_rgb, state, args)
-                    entries.append({"source": source, "detection_index": detection_index,
-                                    "crop": crop_record(crop), "stem": stem,
-                                    "mask_polygon_source": crop.mask_polygon.tolist() if crop.mask_polygon is not None else None})
-            del predictions, frames
-            check_ram(args)
+        source_offset = 0
+        source_group = []
+        with ArchiveSourceGroups(paths, args.detector_batch_size, args, timer) as input_groups:
+            for source_paths, frames in input_groups:
+                source_group = list(enumerate(source_paths, start=source_offset))
+                source_offset += len(source_paths)
+                if frames is None:
+                    frames = [cv2.imread(str(path), cv2.IMREAD_COLOR) for path in source_paths]
+                    if any(frame is None for frame in frames):
+                        raise ValueError("could not decode source image")
+                predictions = detector.predict(frames, imgsz=cfg.imgsz, conf=cfg.conf,
+                    iou=cfg.iou, device=args.device, half=args.starseg_half, rect=False, verbose=False)
+                for (source, path), frame, prediction in zip(source_group, frames, predictions):
+                    records.append({"frame": frame_start + source, "image_path": str(path),
+                                    "source_shape": list(frame.shape[:2]), "stars": []})
+                    for detection_index, detection in enumerate(_result_detections(prediction, ids, require_track_ids=False)):
+                        crop = _crop_result(frame, detection, context_scale=cfg.context_scale)
+                        stem = str(len(entries))
+                        crop_path = spool / f"{stem}_crop.npy"
+                        save_array(crop_path, crop.crop_rgb, state, args)
+                        entries.append({"source": source, "detection_index": detection_index,
+                                        "crop": crop_record(crop), "stem": stem,
+                                        "mask_polygon_source": crop.mask_polygon.tolist() if crop.mask_polygon is not None else None})
+                del predictions, frames
+                check_ram(args)
+        if input_groups.report() is not None:
+            state["archive_decode"] = accumulate_decode_report(state.get("archive_decode"), input_groups.report())
         del detector
         # Loop variables can otherwise retain an Ultralytics GPU Result.
         if source_group:
@@ -106,11 +115,9 @@ def run_shard(args, model_paths, paths, frame_start, spool, timer, state):
             images = hydra.preprocess_batch(crops).to(timer.device)
             if args.channels_last:
                 images = images.contiguous(memory_format=torch.channels_last)
-            if getattr(args, "hydra_output_mode", "full") == "minimal":
-                raw = hydra.predict_tensor_batch_raw(images)
-                activated = None
-            else:
-                raw, activated = hydra.predict_tensor_batch(images)
+            raw, activated = predict_hydra_crops(
+                hydra, images, batch_size=getattr(args, "hydra_batch_size", None),
+                minimal=getattr(args, "hydra_output_mode", "full") == "minimal")
             raw_cpu, images_cpu = raw.cpu().numpy(), images.cpu().numpy()
             for entry, fields, image in zip(group, raw_cpu, images_cpu):
                 save_array(spool / f"{entry['stem']}_raw.npy", fields, state, args)
@@ -185,6 +192,7 @@ def main(argv=None):
                                "Spools are float32 .npy, uncompressed, buffered filesystem I/O without fsync.",
                                "All stage reloads and shard cleanup are included in pipeline elapsed time.",
                                "Allocator/RSS guards are not hard total-device or cgroup limits.",
+                               "Archive decode queues exist only during each detector stage; reported worker decode overlaps its consumer, and reserved bytes exclude consumer batches, codec scratch and page cache.",
                                "Incomplete temporary shards are discarded; completed JSONL remains available, automatic resume not implemented."]}
     state = {"live_bytes": 0, "peak_bytes": 0, "written_bytes": 0}
     timer = b.Timer(device, True)
@@ -214,7 +222,8 @@ def main(argv=None):
             measurement={"source_images": sources, "star_crops": crops, "arms": arms, "empty_source_images": empty,
                          "elapsed_seconds": elapsed, "source_images_per_second": sources / elapsed,
                          "star_crops_per_second": crops / elapsed,
-                         "stages": {k: b.summary(v) for k, v in timer.values.items()}})
+                         "stages": {k: b.summary(v) for k, v in timer.values.items()},
+                         "archive_decode": state.get("archive_decode")})
         return 0
     except Exception as exc:
         report.update(status="failed", error=f"{type(exc).__name__}: {exc}", spool=state)
