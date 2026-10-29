@@ -4,6 +4,8 @@ Portable StarSeg → Hydra → GRU128 inference for cameras, video files, live r
 
 The initial pinned generation uses YOLO26-L segmentation, **DINOv3 ConvNeXt-Base**, and a GRU with 128 hidden units. “128” is the arm-walker state width; the recurrence follows each arm within an image. Live replay adds BoT-SORT animal IDs and per-animal arm association. Archive images are independent. This package does not substitute a Large backbone for the trained Base checkpoint.
 
+The [benchmark results](BENCHMARK_RESULTS.md) report repeated archive and live measurements, output-parity checks, memory observations, and reproduction commands. Measurements use an RTX 5090 with resource guards; RTX 5060 performance and physical 8 GB fit still need deployment-machine verification. Keep detector and crop batches at one for the measured equivalent-output configurations: larger crop groups failed the trained-output parity checks.
+
 ## Download and run
 
 The trained checkpoints are published in [models-seed0-20261028](https://github.com/weertman/deepstarnoodles-inference/releases/tag/models-seed0-20261028). Download the manifest, then let the container fetch and SHA-256-verify all three files. This needs about 793 MB for the checkpoint files, plus the CUDA image.
@@ -14,11 +16,10 @@ cd deepstarnoodles-run
 curl -fL -o manifest.json \
   https://github.com/weertman/deepstarnoodles-inference/releases/download/models-seed0-20261028/manifest.json
 
-# Pull the public image, then preserve its immutable digest.
-IMAGE=ghcr.io/weertman/deepstarnoodles-inference:latest
+# Pull the public image used for the final optimization measurements.
+IMAGE=ghcr.io/weertman/deepstarnoodles-inference@sha256:931c8f145c2553d167bdc627ef6dba054adf9b5e500c537c19565762bd787e64
 docker pull "$IMAGE"
-# Save the immutable registry digest for subsequent runs.
-IMAGE=$(docker image inspect "$IMAGE" --format '{{index .RepoDigests 0}}')
+# Save this exact immutable registry digest for subsequent runs.
 printf '%s\n' "$IMAGE" > image.txt
 
 docker run --rm -v "$PWD:/work" "$IMAGE" \
@@ -27,28 +28,38 @@ docker run --rm -v "$PWD:/work" "$IMAGE" \
 
 `models/` must not already exist. The download command verifies every file and writes a portable local manifest. Fetching weights needs no GPU; inference requires an NVIDIA driver and Docker GPU support.
 
-For an archive, put an `archive.csv` containing an `image_path` column in `inputs/`; paths resolve relative to that CSV. Start conservatively with one detector image and one crop per batch, then benchmark larger batches:
+For an archive, put an `archive.csv` containing an `image_path` column in `inputs/`; paths resolve relative to that CSV. The measured archive configuration keeps both batches at one, uses bounded decode prefetch, skips unused Hydra activations, and checks fixed-slot GRU termination every step:
 
 ```bash
 mkdir -p inputs outputs
 docker run --rm --gpus all --memory=32g --cpus=8 --shm-size=1g \
+  -e OMP_NUM_THREADS=8 -e MKL_NUM_THREADS=8 -e OPENBLAS_NUM_THREADS=1 \
   -v "$PWD/models:/models:ro" -v "$PWD/inputs:/inputs:ro" \
   -v "$PWD/outputs:/outputs" "$IMAGE" \
   archive --models /models --index /inputs/archive.csv \
-  --output /outputs/archive --detector-batch-size 1 --crop-batch-size 1
+  --output /outputs/archive --detector-batch-size 1 --crop-batch-size 1 \
+  --hydra-output-mode minimal --gru-execution fixed --gru-check-interval 1 \
+  --decode-workers 2 --decode-prefetch-frames 4 \
+  --decode-prefetch-mib 256 --decode-max-frame-mib 64 \
+  --allocator-limit-gib 7 --ram-limit-gib 24
 ```
 
-For a local camera, add `--device=/dev/video0:/dev/video0` to the Docker options and replace the final command with `live --models /models --camera 0 --output /outputs/camera --max-seconds 60`. Camera mode keeps one pending frame and reports dropped frames. `live --video /inputs/clip.mp4` processes a file sequentially. Each output directory must be new. The shipped defaults are reference settings; publication alone does not establish 8 GB fit or a live frame-rate guarantee.
+This configuration improved zero-warmup whole-process throughput by 22–33% across two RTX 5090 comparisons (27.48% ratio of mean rates), with strict output parity passing. The archive fits in the host filesystem cache; this is not a cold-storage result. See the [full evidence and limits](BENCHMARK_RESULTS.md).
+
+For a local camera, add `--device=/dev/video0:/dev/video0` to the Docker options and replace the final command with `live --models /models --camera 0 --output /outputs/camera --max-seconds 60 --crop-batch-size 1 --hydra-output-mode minimal --gru-execution fixed --gru-check-interval 1`. Camera mode keeps one pending frame and reports dropped frames. `live --video /inputs/clip.mp4` processes a file sequentially. Each output directory must be new.
+
+The live profile passed all five warmed-replay comparisons. Mean per-run p95 latency fell 14–17% on the three positive ROV clips and 7% on the three-frame crowded probe. The detector-only negative clip was mixed and slower on average. These short, fully warmed replays do not establish sustained camera FPS or reliable tail latency; the camera command includes its first inference and does not perform that warmup. Validate the profile on your stream and 8 GB GPU. CLI defaults remain the full-Hydra/dynamic-GRU reference; omit the three profile flags to return to it.
 
 ## Docker
 
 Build from this directory. The version-pinned runtime is PyTorch 2.8.0, torchvision 0.23.0, CUDA 12.8, and Ultralytics 8.4.51. CUDA 12.8 is selected for the RTX 5060 target. An allocator cap on a larger GPU does not reproduce that GPU's performance or guarantee total VRAM fit.
 
 ```bash
-docker build -t deepstarnoodles-inference:0.3.0 .
+docker build -t deepstarnoodles-inference:0.4.0 .
 docker run --rm --gpus all --memory=32g --cpus=8 --shm-size=1g \
+  -e OMP_NUM_THREADS=8 -e MKL_NUM_THREADS=8 -e OPENBLAS_NUM_THREADS=1 \
   -v "$PWD/models:/models:ro" -v "$PWD/inputs:/inputs:ro" \
-  -v "$PWD/outputs:/outputs" deepstarnoodles-inference:0.3.0 \
+  -v "$PWD/outputs:/outputs" deepstarnoodles-inference:0.4.0 \
   archive --models /models --index /inputs/archive.csv \
   --output /outputs/archive-reference --images 128 --warmup 8 \
   --detector-batch-size 1 --crop-batch-size 1
@@ -81,11 +92,11 @@ deepstarnoodles-inference archive --models models/ --index inputs/archive.csv \
   --archive-frame-window 64 --archive-crop-buffer-mib 256
 ```
 
-`--archive-frame-window 0` is the unchanged default. A positive window (at most 256) limits outstanding source records; the crop queue fills up to `--crop-batch-size` (at most 128 in this mode). A full crop batch, frame-window limit, byte limit, or end of input triggers a flush. Every source record remains in order, including empty detections; source records wait until all their crops finish. No temporal tracker is used. This option requires detector batch size 1 and is rejected for live/replay and staged archive commands.
+`--archive-frame-window 0` is the unchanged default. The tested grouped configurations failed the trained-output parity checks in the [campaign](BENCHMARK_RESULTS.md); this option remains experimental. A positive window (at most 256) limits outstanding source records; the crop queue fills up to `--crop-batch-size` (at most 128 in this mode). A full crop batch, frame-window limit, byte limit, or end of input triggers a flush. Every source record remains in order, including empty detections; source records wait until all their crops finish. No temporal tracker is used. This option requires detector batch size 1 and is rejected for live/replay and staged archive commands.
 
 The byte budget (1–1024 MiB, default 256) covers retained RGB crops **and owned mask polygon arrays**. Crops still have source/context dimensions in this queue; Hydra resizes them to 512 pixels during preprocessing. Exact crop geometry and polygon bytes are checked before allocation, and an individually oversized crop fails explicitly. The current full source frame, current detector descriptors, model/intermediate tensors, native crop/preprocessing scratch, and partial output for one source plus decoded/output data for the active crop group are outside this queue budget; the process RSS guard still applies. Between flushes, FIFO completion leaves partial star output only for the leading unfinished source; later empty-source metadata is bounded by the frame window. Full source arrays and descriptor lists are released after ingesting each frame. Crops never go through a disk spool and models remain resident.
 
-`report.json` identifies `resident-cross-frame-crops`, queue peaks, flush reasons, and the observed crop-batch histogram. Buffered `source_group_latency` measures source ingestion and any flush it triggers, excluding the final EOF flush; it is **not per-image completion latency**. Throughput and whole-job timing include the final drain and cleanup. Warmup and measurement use separate buffers. Increasing the GRU group changes batch membership and can change GPU arithmetic; Hydra batch size 1 alone does not establish exact full-pipeline parity. Keep the existing strict output comparison and paired GPU measurements before selecting this schedule. This candidate has CPU scheduling/geometry tests, not a GPU speed or parity certification.
+`report.json` identifies `resident-cross-frame-crops`, queue peaks, flush reasons, and the observed crop-batch histogram. Buffered `source_group_latency` measures source ingestion and any flush it triggers, excluding the final EOF flush; it is **not per-image completion latency**. Throughput and whole-job timing include the final drain and cleanup. Warmup and measurement use separate buffers. Increasing the GRU group changes batch membership and can change GPU arithmetic; Hydra batch size 1 alone does not establish exact full-pipeline parity. Keep the existing strict output comparison and paired GPU measurements before selecting this schedule. CPU scheduling/geometry tests pass; the trained GPU campaign rejected the tested grouped configurations on output parity.
 
 Ordered archive decode is an opt-in candidate for `archive`, archive-mode `benchmark`, and `staged-archive`:
 
@@ -121,6 +132,7 @@ For a paired decode experiment, reuse the **same immutable Docker image**, check
 IMAGE=$(cat image.txt)
 for WORKERS in 0 2; do
   docker run --rm --gpus all --memory=32g --cpus=8 --shm-size=1g \
+    -e OMP_NUM_THREADS=8 -e MKL_NUM_THREADS=8 -e OPENBLAS_NUM_THREADS=1 \
     -v "$PWD/models:/models:ro" -v "$PWD/inputs:/inputs:ro" \
     -v "$PWD/outputs:/outputs" "$IMAGE" \
     archive --models /models --index /inputs/archive.csv \
@@ -142,16 +154,16 @@ The `live` command consumes BGR frames directly without intermediate image files
 
 ```bash
 deepstarnoodles-inference live --models models/ --camera 0 \
-  --output outputs/camera-session --crop-batch-size 2 --max-seconds 60
+  --output outputs/camera-session --crop-batch-size 1 --max-seconds 60
 deepstarnoodles-inference live --models models/ --video inputs/clip.mp4 \
-  --output outputs/video-session --crop-batch-size 2
+  --output outputs/video-session --crop-batch-size 1
 ```
 
 Camera capture uses a background reader with **one pending latest frame**. If inference falls behind, a new frame replaces that pending frame; overwrite and shutdown discard counts appear in the report. `--queue-policy sequential` disables the background reader. Video files always use sequential capture so each decoded frame is processed once; unpaced video decoding cannot stand in for real camera arrival. The detector and Hydra/GRU stay resident, and crop batches combine animals within the current frame. `--max-frames` counts processed frames. Each new command starts fresh tracker state.
 
 `--hydra-output-mode minimal` is an opt-in allocation/transfer candidate shared by `live`, replay, and archive commands. It retains the same raw Hydra fields for GRU inference, and live tracking receives only its support and mouth maps. The default `full` path remains available for comparison. The Python API selects this with `LiveConfig(hydra_output_mode="minimal")`; compare numerical output and timings before promoting it on a target GPU.
 
-`--gru-execution fixed --gru-check-interval 8` enables an experimental GRU decoder in the same commands, including staged archives. It keeps one slot per seed and masks completed walkers; it checks whether all walkers have stopped every N steps (1–128). The reference decoder remains `--gru-execution dynamic`, and both settings appear in the report's configuration. The Python API uses `LiveConfig(gru_execution="fixed", gru_check_interval=8)`. Fixed slots reduce dynamic compaction and host synchronization, but completed slots still execute neural layers and can increase work. CPU numerical parity tests cover termination, filtering, batching, and real synthetic neural layers; GPU roundoff, performance, and memory fit must be measured before selecting this mode. No trained-image evidence is shipped in the package.
+`--gru-execution fixed --gru-check-interval 8` enables an experimental GRU decoder in the same commands, including staged archives. It keeps one slot per seed and masks completed walkers; it checks whether all walkers have stopped every N steps (1–128). The reference decoder remains `--gru-execution dynamic`, and both settings appear in the report's configuration. The Python API uses `LiveConfig(gru_execution="fixed", gru_check_interval=8)`. Fixed slots reduce dynamic compaction and host synchronization, but completed slots still execute neural layers and can increase work. CPU numerical parity tests cover termination, filtering, batching, and real synthetic neural layers; GPU roundoff, performance, and memory fit must be measured before selecting this mode. The [benchmark results](BENCHMARK_RESULTS.md) record trained-checkpoint comparisons; private input images and raw predictions are not distributed.
 
 `source_index` counts successful capture reads; `processed_index` counts inference calls. Temporal trackers age by processed observations even when the source sequence skips. Reported acquisition time is the monotonic timestamp immediately after OpenCV `read()` returns, **not sensor exposure time**. Queue wait, inference completion, and total post-acquisition latency are measured separately; backend buffering and later JSONL write/flush are outside those latency values. Video timestamps are best-effort OpenCV `POS_MSEC`. Timing means cover the full session; quantiles explicitly cover the most recent 1,024 frames, keeping memory bounded. Cold first inference is included.
 
@@ -164,7 +176,7 @@ The same resident API accepts application-owned frames:
 ```python
 from deepstarnoodles_inference.live import LiveConfig, LivePipeline
 
-pipeline = LivePipeline.from_manifest("models/", LiveConfig(device="cuda:0", crop_batch_size=2))
+pipeline = LivePipeline.from_manifest("models/", LiveConfig(device="cuda:0", crop_batch_size=1))
 result = pipeline.predict(frame_bgr)  # H x W x 3 numpy.uint8, BGR order
 # Call again for subsequent frames from this stream. No file writes are needed.
 pipeline.reset()  # New independent stream; models remain loaded.
