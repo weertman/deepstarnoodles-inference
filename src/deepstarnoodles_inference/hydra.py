@@ -39,6 +39,23 @@ class HydraInferConfig:
     amp: bool = True
 
 
+def store_autocast_weights(model: torch.nn.Module) -> int:
+    """Hold Conv2d and Linear parameters in float16; returns how many modules changed.
+
+    CUDA autocast casts these parameters to float16 on every forward, hundreds
+    of small copies per crop. Casting once stores the same values. Everything
+    else keeps float32 because it does not run through autocast's float16 cast:
+    the normalization layers and ConvNeXt layer scale. The model must then
+    always run under autocast.
+    """
+    changed = 0
+    for module in model.modules():
+        if type(module) in (torch.nn.Conv2d, torch.nn.Linear):
+            module.half()
+            changed += 1
+    return changed
+
+
 def validate_hydra_batch_size(value: int | None) -> None:
     if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
         raise ValueError("hydra_batch_size must be a positive integer or None")
@@ -52,6 +69,7 @@ def predict_hydra_crops(
     batch_size: int | None = None,
     minimal: bool = False,
     tracking: bool = False,
+    graph=None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run bounded Hydra forwards, retaining the full ordered GRU crop group.
 
@@ -60,7 +78,8 @@ def predict_hydra_crops(
     Singleton forwards can help localize batch-dependent numerical drift; this
     does not guarantee GPU parity or lower peak memory. Assemble directly into
     output buffers to avoid retaining all chunks plus a second concatenation.
-    The public predictor methods retain their existing behavior.
+    The public predictor methods retain their existing behavior. A
+    ``HydraGraph`` replays minimal-mode raw forwards; full mode stays eager.
     """
     validate_hydra_batch_size(batch_size)
     if images.ndim != 4 or images.shape[1] != 3 or len(images) < 1:
@@ -68,7 +87,7 @@ def predict_hydra_crops(
 
     def forward(part):
         if minimal:
-            raw = predictor.predict_tensor_batch_raw(part)
+            raw = graph.raw(part) if graph is not None else predictor.predict_tensor_batch_raw(part)
             return raw, predictor.tracking_maps(raw) if tracking else None
         return predictor.predict_tensor_batch(part)
 

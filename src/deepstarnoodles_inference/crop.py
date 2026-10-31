@@ -163,6 +163,27 @@ def _crop_result(
     )
 
 
+def _crop_geometry(
+    frame_bgr: np.ndarray,
+    detection: dict,
+    *,
+    context_scale: float,
+) -> CropResult:
+    """``_crop_result`` without pixels, for crops cut and resized on the GPU."""
+    left, top, side = _square_crop_geometry(detection["xyxy"], context_scale)
+    return CropResult(
+        crop_rgb=None,
+        bbox_xyxy=detection["xyxy"],
+        center=detection["center"],
+        confidence=detection["confidence"],
+        crop_left=float(left),
+        crop_top=float(top),
+        crop_side=float(side),
+        mask_polygon=detection["polygon"],
+        star_track_id=detection["star_track_id"],
+    )
+
+
 class StarCropper:
     def __init__(
         self,

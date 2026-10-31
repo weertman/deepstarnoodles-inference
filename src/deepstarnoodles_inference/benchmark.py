@@ -30,10 +30,10 @@ import torch
 
 from deepstarnoodles_inference.archive_decode import ArchiveSourceGroups
 from deepstarnoodles_inference.crop import (
-    CropConfig, TrackedStarCropper, _crop_result, _result_detections,
+    CropConfig, TrackedStarCropper, _crop_geometry, _crop_result, _result_detections,
     _sunflower_class_ids,
 )
-from deepstarnoodles_inference.hydra import HydraInferConfig, HydraPredictor, predict_hydra_crops
+from deepstarnoodles_inference.hydra import HydraInferConfig, HydraPredictor, predict_hydra_crops, store_autocast_weights
 from deepstarnoodles_inference.noodle_tracer import load_noodle_tracer_checkpoint, trace_arms_noodle_batch
 from deepstarnoodles_inference.runtime import StarArmTrackerRegistry, crop_record, source_arm_records
 
@@ -55,6 +55,23 @@ def parse_args(argv=None):
                    help="Maximum retained RGB crop/polygon arrays in buffered archives (1-1024 MiB); oversized crops fail before allocation")
     p.add_argument("--hydra-batch-size", type=int, default=None,
                    help="Experimental: cap Hydra forward batch independently of the GRU crop batch; omitted uses the full crop batch")
+    p.add_argument("--archive-processes", type=int, default=1,
+                   help="Experimental: shard archive frames round-robin across N resident worker processes on one "
+                        "device (1-16); merged output keeps input order. The allocator limit applies per process; "
+                        "run more than a few under CUDA MPS so their kernels overlap")
+    p.add_argument("--shard-index", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--shard-count", type=int, default=1, help=argparse.SUPPRESS)
+    p.add_argument("--shard-sync", type=Path, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--gru-streams", type=int, default=1,
+                   help="Experimental: roll out up to N crops' GRU graphs concurrently on separate CUDA streams "
+                        "from one thread (1-8; requires --gru-execution graph); archive detect-ahead gathers crops "
+                        "across queued frames")
+    p.add_argument("--crop-streams", type=int, default=1,
+                   help="Experimental: run up to N crop groups of one frame concurrently on separate CUDA streams "
+                        "(1-4); tracking and output keep crop order")
+    p.add_argument("--detect-ahead", type=int, default=0,
+                   help="Experimental archive overlap: run StarSeg and crop preparation up to N source groups "
+                        "ahead of Hydra/GRU on a separate CUDA stream (0 disables, 1-8)")
     p.add_argument("--decode-workers", type=int, choices=(0, 1, 2, 4), default=0,
                    help="Experimental archive-only ordered decode workers; 0 preserves synchronous decode")
     p.add_argument("--decode-prefetch-frames", type=int, default=4,
@@ -71,10 +88,33 @@ def parse_args(argv=None):
     p.add_argument("--hydra-output-mode", choices=("full", "minimal"), default="full",
                    help="Experimental: skip unused activated fields; live tracking activates only support/mouth")
     p.add_argument("--channels-last", action="store_true", help="Experimental Hydra memory layout")
-    p.add_argument("--gru-execution", choices=("dynamic", "fixed"), default="dynamic",
-                   help="Experimental fixed mode keeps all seed slots; dynamic remains the reference")
+    p.add_argument("--hydra-fp16-weights", action="store_true",
+                   help="Hold Hydra Conv2d/Linear weights in float16 instead of casting them on every autocast "
+                        "forward; same outputs, less GPU work")
+    p.add_argument("--hydra-compile", action="store_true",
+                   help="Experimental: torch.compile the Hydra forward before graph capture (requires "
+                        "--hydra-execution graph); not byte-identical to the eager forward")
+    p.add_argument("--hydra-execution", choices=("eager", "graph"), default="eager",
+                   help="Experimental: replay minimal-mode Hydra forwards from CUDA graphs at repeated shapes")
+    p.add_argument("--gru-execution", choices=("dynamic", "fixed", "graph"), default="dynamic",
+                   help="Experimental fixed mode keeps all seed slots; graph replays fixed-slot steps from CUDA "
+                        "graphs with device peak candidates; dynamic remains the reference")
     p.add_argument("--gru-check-interval", type=int, default=8,
-                   help="Fixed mode checks aggregate termination every N steps (1-128); ignored by dynamic mode")
+                   help="Fixed/graph modes check aggregate termination every N steps (1-128); ignored by dynamic mode")
+    p.add_argument("--gru-compile", action="store_true",
+                   help="Experimental: torch.compile the GRU step before graph capture (requires --gru-execution "
+                        "graph); not byte-identical to the eager step")
+    p.add_argument("--gru-graph-first-step", action="store_true",
+                   help="With --gru-execution graph, also replay each rollout's first step from a captured graph")
+    p.add_argument("--cuda-blocking-sync", action="store_true",
+                   help="Threads waiting for the GPU sleep instead of spinning a CPU core; frees CPU quota for "
+                        "decode and crop preparation when several archive processes share a container")
+    p.add_argument("--starseg-execution", choices=("eager", "graph"), default="eager",
+                   help="graph replays StarSeg's backbone and neck from CUDA graphs per input shape; the head and "
+                        "Ultralytics pre/postprocessing stay eager")
+    p.add_argument("--gpu-crops", action="store_true",
+                   help="Archive: cut and resize Hydra crops on the GPU with Pillow's fixed-point bilinear "
+                        "arithmetic (byte-identical inputs); uploads each source frame that has detections")
     args = p.parse_args(argv)
     if not 1 <= args.gru_check_interval <= 128:
         p.error("--gru-check-interval must be between 1 and 128")
@@ -93,6 +133,29 @@ def parse_args(argv=None):
             or not 1 <= args.decode_prefetch_mib <= 1024
             or not 1 <= args.decode_max_frame_mib <= args.decode_prefetch_mib):
         p.error("decode queue requires workers <= prefetch frames <= 64 and 1 <= max-frame MiB <= prefetch MiB <= 1024")
+    if not 1 <= args.archive_processes <= 16:
+        p.error("--archive-processes must be between 1 and 16")
+    if args.archive_processes > 1 and (args.mode != "archive" or args.archive_frame_window or args.profile_stages
+                                       or torch.device(args.device).type != "cuda"):
+        p.error("--archive-processes requires CUDA --mode archive without --archive-frame-window or --profile-stages")
+    sharded = args.shard_count > 1 or args.shard_index is not None or args.shard_sync is not None
+    if sharded and (args.archive_processes != 1 or args.shard_index is None or args.shard_sync is None
+                    or not 0 <= args.shard_index < args.shard_count <= 16 or args.mode != "archive"
+                    or args.archive_frame_window or args.images < args.shard_count):
+        p.error("internal shard options are invalid")
+    if not 1 <= args.crop_streams <= 4 or (args.crop_streams > 1 and (torch.device(args.device).type != "cuda"
+                                                                       or args.archive_frame_window
+                                                                       or args.profile_stages)):
+        p.error("--crop-streams must be 1-4; above 1 requires CUDA without --archive-frame-window or --profile-stages")
+    if not 1 <= args.gru_streams <= 8 or (args.gru_streams > 1 and (args.gru_execution != "graph"
+                                                                     or args.crop_streams > 1
+                                                                     or args.archive_frame_window)):
+        p.error("--gru-streams must be 1-8; above 1 requires --gru-execution graph without --crop-streams "
+                "or --archive-frame-window")
+    if not 0 <= args.detect_ahead <= 8:
+        p.error("--detect-ahead must be between 0 and 8")
+    if args.detect_ahead and (args.mode != "archive" or args.archive_frame_window or args.profile_stages):
+        p.error("--detect-ahead requires --mode archive without --archive-frame-window or --profile-stages")
     if args.mode != "archive" and args.decode_workers:
         p.error("--decode-workers is archive-only; live replay keeps synchronous ordered input")
     if args.mode == "live-replay" and args.detector_batch_size != 1:
@@ -102,6 +165,27 @@ def parse_args(argv=None):
         p.error("memory budgets must be finite and positive")
     if args.starseg_half and torch.device(args.device).type != "cuda":
         p.error("--starseg-half requires CUDA")
+    if args.hydra_fp16_weights and (args.hydra_fp32 or torch.device(args.device).type != "cuda"):
+        p.error("--hydra-fp16-weights requires CUDA autocast")
+    if args.hydra_compile and args.hydra_execution != "graph":
+        p.error("--hydra-compile requires --hydra-execution graph")
+    if args.gru_execution == "graph" and torch.device(args.device).type != "cuda":
+        p.error("--gru-execution graph requires CUDA")
+    if args.gru_compile and args.gru_execution != "graph":
+        p.error("--gru-compile requires --gru-execution graph")
+    if args.gru_graph_first_step and args.gru_execution != "graph":
+        p.error("--gru-graph-first-step requires --gru-execution graph")
+    if args.starseg_execution == "graph" and torch.device(args.device).type != "cuda":
+        p.error("--starseg-execution graph requires CUDA")
+    if args.cuda_blocking_sync and torch.device(args.device).type != "cuda":
+        p.error("--cuda-blocking-sync requires CUDA")
+    if args.gpu_crops and (args.mode != "archive" or args.archive_frame_window
+                           or torch.device(args.device).type != "cuda"):
+        p.error("--gpu-crops requires CUDA and --mode archive without --archive-frame-window")
+    if args.gpu_crops and args.crop_streams > 1:
+        p.error("--gpu-crops shares uploaded frames on one stream; use --crop-streams 1")
+    if args.hydra_execution == "graph" and (torch.device(args.device).type != "cuda" or args.hydra_output_mode != "minimal"):
+        p.error("--hydra-execution graph requires CUDA and --hydra-output-mode minimal")
     return args
 
 
@@ -163,6 +247,15 @@ def input_paths(index, count):
             yield resolve(row["image_path"], index.resolve().parent)
 
 
+def measured_paths(args, count, shard):
+    """Global inputs, or this child's round-robin shard of the timed inputs."""
+    paths = input_paths(args.index, count)
+    shards = getattr(args, "shard_count", 1) or 1
+    if shard and shards > 1:
+        return islice(paths, args.shard_index, None, shards), len(range(args.shard_index, count, shards))
+    return paths, count
+
+
 def chunks(items, size):
     iterator = iter(items)
     while batch := list(islice(iterator, size)):
@@ -213,9 +306,22 @@ class Cascade:
         self.crop_config = CropConfig(device=args.device, half=args.starseg_half, rect=False)
         self.detector = YOLO(str(paths["starseg"]))
         self.sunflower_ids = _sunflower_class_ids(self.detector)
+        self.starseg_graph = None
+        if getattr(args, "starseg_execution", "eager") == "graph":
+            from .starseg_graph import StarSegGraph
+            self.starseg_graph = StarSegGraph(self.detector.model).install()
         self.hydra = HydraPredictor(paths["hydra"], HydraInferConfig(device=args.device, amp=not args.hydra_fp32))
+        if getattr(args, "hydra_fp16_weights", False):
+            store_autocast_weights(self.hydra.model)
         if args.channels_last:
             self.hydra.model.to(memory_format=torch.channels_last)
+        if getattr(args, "hydra_compile", False):
+            from .gru_compile import compile_hydra
+            compile_hydra(self.hydra)
+        self.hydra_graph = None
+        if getattr(args, "hydra_execution", "eager") == "graph":
+            from .hydra_graph import HydraGraph
+            self.hydra_graph = HydraGraph(self.hydra)
         self.tracer, self.trace_params, self.tracer_metadata, _ = load_noodle_tracer_checkpoint(str(paths["tracer"]), device=args.device)
         if self.tracer.hidden_size != 128:
             raise ValueError("expected the pinned GRU128 checkpoint")
@@ -226,6 +332,23 @@ class Cascade:
         self.live_cropper = (TrackedStarCropper(config=self.crop_config, model=self.detector)
                              if args.mode == "live-replay" else None)
         self.registry = StarArmTrackerRegistry()
+        self.gpu_crops = None
+        if getattr(args, "gpu_crops", False):
+            from .crop_gpu import GpuCropPreparer
+            self.gpu_crops = GpuCropPreparer(self.hydra.image_size, self.device)
+
+    def graph_rollout(self):
+        """Lazily create the CUDA-graph cache used by ``--gru-execution graph``."""
+        rollout = getattr(self, "gru_graph", None)
+        if rollout is None:
+            from .noodle_tracer_graph import FixedSlotGraphRollout
+            rollout = FixedSlotGraphRollout(
+                self.tracer, self.trace_params,
+                steps_per_replay=getattr(self.args, "gru_check_interval", 8),
+                compile_step=getattr(self.args, "gru_compile", False),
+                graph_first_step=getattr(self.args, "gru_graph_first_step", False))
+            self.gru_graph = rollout
+        return rollout
 
     def reset(self):
         if self.live_cropper:
@@ -250,11 +373,31 @@ class Cascade:
         """
         frames, records, observations = self.detect_frames(frames, start_index, timer, source_paths=source_paths)
         total_arms = 0
-        for group in chunks(observations, self.args.crop_batch_size):
+        groups = list(chunks(observations, self.args.crop_batch_size))
+        uploads = None
+        if getattr(self, "gpu_crops", None) is not None and observations:
+            with timer.stage("frame_upload"):
+                uploads = self.upload_frames(frames, observations)
+        if self.gru_streams() > 1 and len(groups) > 1:
+            jobs = []
+            for group in groups:
+                with timer.stage("crop_preprocess_transfer"):
+                    crop_group = self.crop_group(frames, group)
+                    jobs.append((records, start_index, crop_group, self.preprocess_crops(crop_group, uploads)))
+            total_arms = self.infer_many(jobs, timer)
+            groups = []
+        if self.crop_streams() > 1 and len(groups) > 1:
+            def job(group):
+                def prepare(_workspace):
+                    crop_group = self.crop_group(frames, group)
+                    return crop_group, self.preprocess_crops(crop_group)
+                return prepare
+            total_arms = self.infer_parallel([job(group) for group in groups], records, start_index, timer)
+            groups = []
+        for group in groups:
             with timer.stage("crop_preprocess_transfer"):
-                crop_group = [(i, j, (item if self.live_cropper else _crop_result(
-                    frames[i], item, context_scale=self.crop_config.context_scale))) for i, j, item in group]
-                images = self.preprocess_crops(crop_group)
+                crop_group = self.crop_group(frames, group)
+                images = self.preprocess_crops(crop_group, uploads)
             total_arms += self.infer_crops(crop_group, images, records, start_index, timer)
             del images, crop_group
         if self.live_cropper:
@@ -296,29 +439,59 @@ class Cascade:
                 del predictions
         return frames, records, observations
 
-    def preprocess_crops(self, crop_group):
+    def crop_group(self, frames, group):
+        """``(i, j, CropResult)`` for one observation group; GPU crops leave the pixels to ``preprocess_crops``."""
+        if self.live_cropper:
+            return list(group)
+        make = _crop_geometry if getattr(self, "gpu_crops", None) is not None else _crop_result
+        return [(i, j, make(frames[i], item, context_scale=self.crop_config.context_scale)) for i, j, item in group]
+
+    def upload_frames(self, frames, observations):
+        """Device copies of the source frames with detections, keyed by local index (GPU crops only)."""
+        if getattr(self, "gpu_crops", None) is None:
+            return None
+        return {i: self.gpu_crops.upload(frames[i]) for i in sorted({i for i, _j, _item in observations})}
+
+    def preprocess_crops(self, crop_group, uploads=None):
         """Training-time crop preparation shared by immediate/buffered archives."""
-        images = self.hydra.preprocess_batch([c.crop_rgb for _, _, c in crop_group]).to(self.device)
+        if uploads is not None:
+            images = self.gpu_crops.prepare(uploads, crop_group)
+        else:
+            images = self.hydra.preprocess_batch([c.crop_rgb for _, _, c in crop_group]).to(self.device)
         if self.args.channels_last:
             images = images.contiguous(memory_format=torch.channels_last)
         return images
 
-    def infer_crops(self, crop_group, images, records, start_index, timer):
-        """One ordered Hydra/GRU group; update indexed source records in place."""
-        total_arms = 0
+    def compute_crops(self, crop_group, images, timer, workspace=None):
+        """Hydra and GRU for one ordered crop group; returns ``(activated, decoded)``.
+
+        ``workspace`` supplies per-stream graph state for concurrent crop streams.
+        """
+        hydra_graph = getattr(self, "hydra_graph", None) if workspace is None else workspace.hydra_graph
         with timer.stage("hydra"):
             minimal = getattr(self.args, "hydra_output_mode", "full") == "minimal"
             raw, activated = predict_hydra_crops(
                 self.hydra, images, batch_size=getattr(self.args, "hydra_batch_size", None),
-                minimal=minimal, tracking=self.live_cropper is not None)
+                minimal=minimal, tracking=self.live_cropper is not None, graph=hydra_graph)
         with timer.stage("gru"):
-            if getattr(self.args, "gru_execution", "dynamic") == "fixed":
+            execution = getattr(self.args, "gru_execution", "dynamic")
+            if execution in ("fixed", "graph"):
                 from .noodle_tracer_fixed import trace_arms_noodle_batch_fixed_slots
+                graph_options = {}
+                if execution == "graph":
+                    rollout = self.graph_rollout() if workspace is None else workspace.rollout()
+                    graph_options = {"graph_rollout": rollout, "device_peaks": True}
                 decoded = trace_arms_noodle_batch_fixed_slots(
                     raw, images, self.tracer, self.trace_params,
-                    check_interval=getattr(self.args, "gru_check_interval", 8))
+                    check_interval=getattr(self.args, "gru_check_interval", 8), **graph_options)
             else:
                 decoded = trace_arms_noodle_batch(raw, images, self.tracer, self.trace_params)
+        return activated, decoded
+
+    def record_crops(self, crop_group, activated, decoded, records, start_index, timer):
+        """Track (live) and serialize decoded arms in crop order; returns arm count."""
+        total_arms = 0
+        minimal = getattr(self.args, "hydra_output_mode", "full") == "minimal"
         with timer.stage("postprocess_track"):
             for k, ((i, j, crop), arms) in enumerate(zip(crop_group, decoded)):
                 if self.live_cropper:
@@ -342,16 +515,174 @@ class Cascade:
                 total_arms += len(arms)
         return total_arms
 
+    def infer_crops(self, crop_group, images, records, start_index, timer):
+        """One ordered Hydra/GRU group; update indexed source records in place."""
+        activated, decoded = self.compute_crops(crop_group, images, timer)
+        return self.record_crops(crop_group, activated, decoded, records, start_index, timer)
 
-def measure(pipeline, args, count, sink, profile):
+    def crop_streams(self):
+        return getattr(self.args, "crop_streams", 1) or 1
+
+    def gru_streams(self):
+        return getattr(self.args, "gru_streams", 1) or 1
+
+    def gru_concurrent(self):
+        scheduler = getattr(self, "_gru_concurrent", None)
+        if scheduler is None:
+            from .noodle_tracer_graph import ConcurrentGraphRollouts
+            scheduler = self._gru_concurrent = ConcurrentGraphRollouts(
+                self.tracer, self.trace_params, slots=self.gru_streams(),
+                compile_step=getattr(self.args, "gru_compile", False),
+                graph_first_step=getattr(self.args, "gru_graph_first_step", False))
+        return scheduler
+
+    def infer_many(self, jobs, timer):
+        """Hydra each ``(records, start_index, crop_group, images)`` job, then roll out
+        all of their GRUs concurrently; tracking and records keep job order."""
+        from .noodle_tracer_graph import trace_arms_fixed_slots_concurrent
+
+        minimal = getattr(self.args, "hydra_output_mode", "full") == "minimal"
+        hydra_out = []
+        with timer.stage("hydra"):
+            for _records, _start, _crop_group, images in jobs:
+                hydra_out.append(predict_hydra_crops(
+                    self.hydra, images, batch_size=getattr(self.args, "hydra_batch_size", None),
+                    minimal=minimal, tracking=self.live_cropper is not None,
+                    graph=getattr(self, "hydra_graph", None)))
+        with timer.stage("gru"):
+            decoded = trace_arms_fixed_slots_concurrent(
+                [(raw, job[3]) for (raw, _activated), job in zip(hydra_out, jobs)],
+                self.tracer, self.trace_params, self.gru_concurrent())
+        total = 0
+        for (records, start, crop_group, _images), (_raw, activated), arms in zip(jobs, hydra_out, decoded):
+            total += self.record_crops(crop_group, activated, arms, records, start, timer)
+        return total
+
+    def infer_parallel(self, jobs, records, start_index, timer):
+        """Run crop-group jobs concurrently on per-stream workspaces; record in order.
+
+        Each job maps a workspace to ``(crop_group, images)`` on that workspace's
+        current stream. Hydra/GRU work for different groups overlaps; tracking
+        and output records keep the original group order.
+        """
+        from .crop_streams import CropStreams
+
+        streams = getattr(self, "_crop_stream_pool", None)
+        if streams is None:
+            streams = self._crop_stream_pool = CropStreams(self, self.crop_streams())
+        total_arms = 0
+        for crop_group, activated, decoded in streams.map(jobs):
+            total_arms += self.record_crops(crop_group, activated, decoded, records, start_index, timer)
+        return total_arms
+
+    def close(self):
+        streams = getattr(self, "_crop_stream_pool", None)
+        if streams is not None:
+            streams.close()
+            self._crop_stream_pool = None
+        if getattr(self, "_gru_concurrent", None) is not None:
+            self.gru_concurrent_summary = self._gru_concurrent.summary()
+
+
+def measure_detect_ahead(pipeline, args, count, sink, shard=False):
+    """Archive measurement with StarSeg/crop preparation overlapped ahead."""
+    from .detect_ahead import DetectAhead
+
+    paths, count = measured_paths(args, count, shard)
+
+    timer = Timer(pipeline.device, False)
+    stream_sync = (torch.cuda.current_stream(pipeline.device).synchronize
+                   if pipeline.device.type == "cuda" else (lambda: None))
+    groups_ms, source_count, crop_count, arm_count, empty_count = [], 0, 0, 0, 0
+    timer.sync()
+    run_start = time.perf_counter()
+    with ArchiveSourceGroups(paths, args.detector_batch_size, args, timer) as source:
+        with DetectAhead(pipeline, source, depth=args.detect_ahead,
+                         crop_batch_size=args.crop_batch_size, timer=timer) as ahead:
+            gather = pipeline.gru_streams() > 1
+            while True:
+                start = time.perf_counter()
+                item = ahead.get()
+                if item is None:
+                    break
+                if gather:
+                    # Concurrent GRUs: take every already-queued frame (bounded)
+                    # so independent crops from several frames overlap.
+                    batch = [item]
+                    while sum(len(entry[3]) for entry in batch) < 2 * pipeline.gru_streams() and len(batch) < 8:
+                        extra = ahead.poll()
+                        if extra is None or extra is ahead.EMPTY:
+                            break
+                        batch.append(extra)
+                    jobs, offsets = [], []
+                    for paths_b, records_b, _crops_b, groups_b in batch:
+                        offsets.append(source_count + sum(len(entry[0]) for entry in batch[:len(offsets)]))
+                        for crop_group, images in ahead.consume(groups_b):
+                            jobs.append((records_b, offsets[-1], crop_group, images))
+                    arms = pipeline.infer_many(jobs, timer) if jobs else 0
+                    del jobs
+                    for paths_b, records_b, crops_b, _groups_b in batch:
+                        for record in records_b:
+                            sink.write(json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n")
+                        source_count += len(paths_b)
+                        crop_count += crops_b
+                        empty_count += sum(not record["stars"] for record in records_b)
+                    sink.flush()
+                    arm_count += arms
+                    stream_sync()
+                    groups_ms.append((time.perf_counter() - start) * 1000)
+                    del batch
+                    if host_peak_bytes() > args.ram_limit_gib * 1024**3:
+                        raise MemoryError("process high-water RSS exceeded --ram-limit-gib")
+                    continue
+                paths, records, crops, groups = item
+                arms = 0
+                if pipeline.crop_streams() > 1 and len(groups) > 1:
+                    arms = pipeline.infer_parallel([ahead.job(group) for group in groups], records,
+                                                   source_count, timer)
+                else:
+                    for crop_group, images in ahead.consume(groups):
+                        arms += pipeline.infer_crops(crop_group, images, records, source_count, timer)
+                        del images
+                del groups
+                for record in records:
+                    sink.write(json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n")
+                sink.flush()
+                # Consumer-stream completion only: the producer stream keeps running.
+                stream_sync()
+                groups_ms.append((time.perf_counter() - start) * 1000)
+                source_count += len(paths)
+                crop_count += crops
+                arm_count += arms
+                empty_count += sum(not record["stars"] for record in records)
+                if host_peak_bytes() > args.ram_limit_gib * 1024**3:
+                    raise MemoryError("process high-water RSS exceeded --ram-limit-gib")
+            ahead_report = ahead.report()
+    timer.sync()
+    elapsed = time.perf_counter() - run_start
+    if source_count != count:
+        raise ValueError(f"requested {count} images but input CSV supplied {source_count}")
+    return {"source_images": source_count, "star_crops": crop_count, "arms": arm_count,
+            "empty_source_images": empty_count, "elapsed_seconds": elapsed,
+            "source_images_per_second": source_count / elapsed if elapsed else None,
+            "star_crops_per_second": crop_count / elapsed if elapsed else None,
+            "source_group_latency": summary(groups_ms), "group_ms": groups_ms,
+            "group_latency_scope": "consumer dequeue through output flush; detection ran ahead",
+            "stages": {}, "archive_decode": source.report(), "detect_ahead": ahead_report}
+
+
+def measure(pipeline, args, count, sink, profile, *, shard=False):
     if getattr(args, "archive_frame_window", 0):
         from .archive_buffer import measure_buffered_archive
         return measure_buffered_archive(pipeline, args, count, sink, profile)
+    if getattr(args, "detect_ahead", 0):
+        return measure_detect_ahead(pipeline, args, count, sink, shard)
+    paths, count = measured_paths(args, count, shard)
     timer = Timer(pipeline.device, profile)
     groups_ms, source_count, crop_count, arm_count, empty_count = [], 0, 0, 0, 0
     timer.sync()
     run_start = time.perf_counter()
-    with ArchiveSourceGroups(input_paths(args.index, count), args.detector_batch_size, args, timer) as source:
+    with ArchiveSourceGroups(paths, args.detector_batch_size, args, timer) as source:
         while True:
             timer.sync()
             start = time.perf_counter()
@@ -390,14 +721,25 @@ def measure(pipeline, args, count, sink, profile):
 
 def main(argv=None):
     job_started = time.perf_counter()
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
     if args.models.is_dir():
         args.models = args.models / "manifest.json"
+    if args.archive_processes > 1:
+        if sum(1 for _ in input_paths(args.index, max(args.images, args.warmup))) < max(args.images, args.warmup):
+            raise ValueError("input CSV does not contain enough images")
+        verify_models(args.models)
+        from .archive_shards import run_sharded
+        return run_sharded(args, argv, job_started)
     manifest, paths = verify_models(args.models)
     # Check input syntax before allocating GPU memory or creating results.
     if sum(1 for _ in input_paths(args.index, max(args.images, args.warmup))) < max(args.images, args.warmup):
         raise ValueError("input CSV does not contain enough images")
     device = torch.device(args.device)
+    blocking_sync = None
+    if args.cuda_blocking_sync:
+        from .cuda_sched import request_blocking_sync
+        blocking_sync = request_blocking_sync(device)
     if device.type == "cuda":
         torch.cuda.set_device(device)
         total = torch.cuda.get_device_properties(device).total_memory
@@ -422,7 +764,8 @@ def main(argv=None):
                               "Archive mode here is resident microbatching; compare staged-archive separately for disk-spooled scheduling."]}
     if device.type == "cuda":
         report["inventory"].update(gpu_name=torch.cuda.get_device_name(device), gpu_total_memory_bytes=total,
-                                    gpu_capability=list(torch.cuda.get_device_capability(device)))
+                                    gpu_capability=list(torch.cuda.get_device_capability(device)),
+                                    cuda_blocking_sync=blocking_sync)
     try:
         report["input_files"] = [{"path": str(path), "sha256": sha256(path)}
                                  for path in input_paths(args.index, max(args.images, args.warmup))]
@@ -456,14 +799,32 @@ def main(argv=None):
                 report["startup_peak_allocated_bytes"] = torch.cuda.max_memory_allocated(device)
                 report["startup_peak_reserved_bytes"] = torch.cuda.max_memory_reserved(device)
                 torch.cuda.reset_peak_memory_stats(device)
+            if args.shard_sync is not None:
+                from .archive_shards import wait_for_start
+                report["shard_start_epoch"] = wait_for_start(args.shard_sync, args.shard_index)
             with (args.output / "predictions.jsonl").open("x") as sink:
-                report["measurement"] = measure(pipeline, args, args.images, sink, args.profile_stages)
+                report["measurement"] = measure(pipeline, args, args.images, sink, args.profile_stages,
+                                                shard=args.shard_sync is not None)
+            report["measurement"]["finished_epoch"] = time.time()
+        graph = getattr(pipeline, "gru_graph", None)
+        if graph is not None:
+            report["gru_graph"] = graph.summary()
+        if getattr(pipeline, "_gru_concurrent", None) is not None:
+            report["gru_concurrent"] = pipeline._gru_concurrent.summary()
+        if getattr(pipeline, "hydra_graph", None) is not None:
+            report["hydra_graph"] = pipeline.hydra_graph.summary()
+        if getattr(pipeline, "gpu_crops", None) is not None:
+            report["gpu_crops"] = pipeline.gpu_crops.summary()
+        if getattr(pipeline, "starseg_graph", None) is not None:
+            report["starseg_graph"] = pipeline.starseg_graph.summary()
         report["status"] = "complete"
         return 0
     except Exception as exc:
         report.update(status="failed", error=f"{type(exc).__name__}: {exc}")
         raise
     finally:
+        if "pipeline" in locals() and hasattr(pipeline, "close"):
+            pipeline.close()
         report["total_job_seconds"] = time.perf_counter() - job_started
         report["host_peak_rss_bytes"] = host_peak_bytes()
         if device.type == "cuda":
