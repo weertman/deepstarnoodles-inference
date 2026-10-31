@@ -3,6 +3,8 @@
 """Experimental fixed-slot GRU rollout; dynamic execution remains the default."""
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import numpy as np
 import torch
 from .noodle_tracer import (
@@ -29,30 +31,31 @@ def _sample_fixed_patches(model, fields, pyramid, positions, image_indices, rang
     return torch.cat(dense_parts), torch.cat(fine_parts), torch.cat(coarse_parts)
 
 
+@dataclass
+class FixedSlotJob:
+    """Seeds and fields for one fixed-slot rollout, before any recurrent step."""
+
+    model: NoodleTracer
+    params: NoodleTraceParams
+    raw_t: torch.Tensor
+    image_t: torch.Tensor
+    batch_size: int
+    outputs: list
+    device_peaks: bool
+    host_fields: np.ndarray | None
+    peak_support_by_image: list
+    device_base_peaks: list | None
+    tips: np.ndarray | None = None
+    positions: torch.Tensor | None = None
+    image_indices: torch.Tensor | None = None
+    seeds: torch.Tensor | None = None
+    ranges: list = field(default_factory=list)
+    count: int = 0
+
+
 @torch.no_grad()
-def trace_arms_noodle_batch_fixed_slots(
-    raw: np.ndarray | torch.Tensor,
-    images: np.ndarray | torch.Tensor,
-    model: NoodleTracer,
-    params: NoodleTraceParams | None = None,
-    *,
-    check_interval: int = 8,
-    diagnostics: dict | None = None,
-) -> list[list[dict]]:
-    """Experimental opt-in rollout with fixed walker slots and masked state.
-
-    Initial CPU seed counts define permanent, contiguous image ranges. Dead
-    walkers keep their state but still execute until a periodic aggregate check.
-    No seed limits, model precision, decoder thresholds or output rules change.
-    This prototype must pass parity and measured GPU performance gates before
-    promotion. The unchanged noodle_tracer.trace_arms_noodle_batch is reference.
-    """
-    if isinstance(check_interval, bool) or not isinstance(check_interval, int) or not 1 <= check_interval <= 128:
-        raise ValueError("check_interval must be a positive integer between 1 and 128")
-    if diagnostics is not None:
-        diagnostics.update(execution="fixed_slots", check_interval=check_interval,
-                           seeds=0, rollout_steps=0, aggregate_checks=0, scheduled_slot_steps=0)
-
+def prepare_fixed_slots(raw, images, model, params=None, *, device_peaks=False) -> FixedSlotJob:
+    """Validate inputs and select seeds exactly as the fixed-slot decoder does."""
     params = params or NoodleTraceParams(
         dense_patch_size=model.dense_patch_size,
         rgb_feature_patch_size=model.rgb_feature_patch_size,
@@ -89,23 +92,37 @@ def trace_arms_noodle_batch_fixed_slots(
     batch_size = int(raw_t.shape[0])
     outputs: list[list[dict]] = [[] for _ in range(batch_size)]
 
-    # Preserve exact SciPy peak extraction while moving only fields used by
-    # host-side seed/base postprocessing: raw support, activated support/base/
-    # tip, and the identity embedding.  The full 18-channel tensor stays on GPU.
-    host_fields = torch.cat(
-        (
-            raw_t[:, 0:1],
-            torch.sigmoid(raw_t[:, 0:1]),
-            torch.sigmoid(raw_t[:, 8:10]),
-            raw_t[:, 10 : 10 + params.embedding_dim],
-        ),
-        dim=1,
-    ).detach().cpu().numpy()
     tips_by_image: list[np.ndarray] = []
     peak_support_by_image: list[np.ndarray | None] = []
     seed_arrays: list[np.ndarray] = []
     source_indices: list[np.ndarray] = []
-    for image_index in range(batch_size):
+    device_base_peaks: list[np.ndarray] | None = None
+    if device_peaks:
+        from .device_peaks import device_seed_inputs
+
+        host_fields = None
+        device_base_peaks = []
+        for image_index in range(batch_size):
+            tips, image_seeds, base_peaks = device_seed_inputs(raw_t, params, image_index)
+            tips_by_image.append(tips)
+            device_base_peaks.append(base_peaks)
+            if len(tips):
+                seed_arrays.append(image_seeds)
+                source_indices.append(np.full(len(tips), image_index, dtype=np.int64))
+    else:
+        # Preserve exact SciPy peak extraction while moving only fields used by
+        # host-side seed/base postprocessing: raw support, activated support/base/
+        # tip, and the identity embedding.  The full 18-channel tensor stays on GPU.
+        host_fields = torch.cat(
+            (
+                raw_t[:, 0:1],
+                torch.sigmoid(raw_t[:, 0:1]),
+                torch.sigmoid(raw_t[:, 8:10]),
+                raw_t[:, 10 : 10 + params.embedding_dim],
+            ),
+            dim=1,
+        ).detach().cpu().numpy()
+    for image_index in range(0 if device_peaks else batch_size):
         fields = host_fields[image_index]
         raw_support = fields[0]
         activated_support = fields[1]
@@ -145,8 +162,11 @@ def trace_arms_noodle_batch_fixed_slots(
             np.full(len(tips), image_index, dtype=np.int64)
         )
     count = sum(len(tips) for tips in tips_by_image)
+    job = FixedSlotJob(model=model, params=params, raw_t=raw_t, image_t=image_t, batch_size=batch_size,
+                       outputs=outputs, device_peaks=device_peaks, host_fields=host_fields,
+                       peak_support_by_image=peak_support_by_image, device_base_peaks=device_base_peaks)
     if count == 0:
-        return outputs
+        return job
 
     tips = np.concatenate(
         [tips for tips in tips_by_image if len(tips)],
@@ -163,6 +183,57 @@ def trace_arms_noodle_batch_fixed_slots(
         dtype=torch.float32,
         device=device,
     )
+    # CPU peak extraction already knows these ranges; never re-group CUDA
+    # image indices with nonzero during the rollout.
+    ranges = []
+    offset = 0
+    for image_index, image_tips in enumerate(tips_by_image):
+        end = offset + len(image_tips)
+        if end > offset:
+            ranges.append((image_index, offset, end))
+        offset = end
+    job.tips, job.positions, job.image_indices, job.seeds = tips, positions, image_indices, seeds
+    job.ranges, job.count = ranges, count
+    return job
+
+
+@torch.no_grad()
+def trace_arms_noodle_batch_fixed_slots(
+    raw: np.ndarray | torch.Tensor,
+    images: np.ndarray | torch.Tensor,
+    model: NoodleTracer,
+    params: NoodleTraceParams | None = None,
+    *,
+    check_interval: int = 8,
+    diagnostics: dict | None = None,
+    graph_rollout=None,
+    device_peaks: bool = False,
+) -> list[list[dict]]:
+    """Experimental opt-in rollout with fixed walker slots and masked state.
+
+    Initial CPU seed counts define permanent, contiguous image ranges. Dead
+    walkers keep their state but still execute until a periodic aggregate check.
+    No seed limits, model precision, decoder thresholds or output rules change.
+    This prototype must pass parity and measured GPU performance gates before
+    promotion. The unchanged noodle_tracer.trace_arms_noodle_batch is reference.
+
+    ``graph_rollout`` (a ``FixedSlotGraphRollout``) replays the same loop body
+    from cached CUDA graphs; seed selection and output assembly are shared.
+    ``device_peaks`` extracts peak candidates and seed windows on the field's
+    device and applies the unchanged host rules to them (see device_peaks).
+    """
+    if isinstance(check_interval, bool) or not isinstance(check_interval, int) or not 1 <= check_interval <= 128:
+        raise ValueError("check_interval must be a positive integer between 1 and 128")
+    if diagnostics is not None:
+        diagnostics.update(execution="fixed_slots", check_interval=check_interval,
+                           seeds=0, rollout_steps=0, aggregate_checks=0, scheduled_slot_steps=0)
+
+    job = prepare_fixed_slots(raw, images, model, params, device_peaks=device_peaks)
+    if job.count == 0:
+        return job.outputs
+    params, raw_t, image_t, count = job.params, job.raw_t, job.image_t, job.count
+    positions, image_indices, seeds, ranges = job.positions, job.image_indices, job.seeds, job.ranges
+    device = raw_t.device
     hidden = model.initial_state(count, device=device)
     previous = torch.zeros((count, 2), device=device)
     active = torch.ones(count, dtype=torch.bool, device=device)
@@ -190,20 +261,19 @@ def trace_arms_noodle_batch_fixed_slots(
         dtype=torch.int8,
         device=device,
     )
-    # CPU peak extraction already knows these ranges; never re-group CUDA
-    # image indices with nonzero during the rollout.
-    ranges = []
-    offset = 0
-    for image_index, image_tips in enumerate(tips_by_image):
-        end = offset + len(image_tips)
-        if end > offset:
-            ranges.append((image_index, offset, end))
-        offset = end
     if diagnostics is not None:
         diagnostics["seeds"] = count
     pyramid = model.encode_rgb(image_t)
     height, width = raw_t.shape[-2:]
-    for step_index in range(params.max_steps):
+    graph_state = (None if graph_rollout is None else graph_rollout.run(
+        raw_t, pyramid, positions, image_indices, seeds, ranges, diagnostics))
+    if graph_state is not None:
+        if diagnostics is not None:
+            diagnostics["execution"] = "fixed_slots_cuda_graph"
+        path_history, path_counts = graph_state.path_history, graph_state.path_counts
+        accepted, state_confidence = graph_state.accepted, graph_state.state_confidence
+        stop_codes = graph_state.stop_codes
+    for step_index in range(0 if graph_state is not None else params.max_steps):
         if step_index and step_index % check_interval == 0:
             if diagnostics is not None:
                 diagnostics["aggregate_checks"] += 1
@@ -289,6 +359,24 @@ def trace_arms_noodle_batch_fixed_slots(
     accepted_np = accepted.detach().cpu().numpy()
     state_confidence_np = state_confidence.detach().cpu().numpy()
     stop_codes_np = stop_codes.detach().cpu().numpy()
+    return finish_fixed_slots(job, path_history_np, path_counts_np, accepted_np,
+                              state_confidence_np, stop_codes_np)
+
+
+def finish_fixed_slots(job: FixedSlotJob, path_history_np, path_counts_np, accepted_np,
+                       state_confidence_np, stop_codes_np) -> list[list[dict]]:
+    """Assemble arms from final host rollout arrays exactly as the decoder does."""
+    model, params, outputs, tips, count = job.model, job.params, job.outputs, job.tips, job.count
+    seeds, image_indices, batch_size = job.seeds, job.image_indices, job.batch_size
+    host_fields, device_peaks = job.host_fields, job.device_peaks
+    peak_support_by_image, device_base_peaks = job.peak_support_by_image, job.device_base_peaks
+    stop_invalid = int(TraceState.INVALID_SEED)
+    stop_base = int(TraceState.TERMINATE_BASE)
+    stop_lost = int(TraceState.TERMINATE_LOST)
+    stop_bounds = len(TraceState)
+    stop_max_length = stop_bounds + 1
+    stop_loop = stop_bounds + 2
+    stop_max_steps = stop_bounds + 3
     seeds_np = seeds.detach().cpu().numpy()
     image_indices_np = image_indices.detach().cpu().numpy()
     stop_names = {
@@ -300,8 +388,8 @@ def trace_arms_noodle_batch_fixed_slots(
         stop_loop: "loop",
         stop_max_steps: "max_steps",
     }
-    base_peaks_by_image: list[np.ndarray] = []
-    for image_index in range(batch_size):
+    base_peaks_by_image: list[np.ndarray] = device_base_peaks or []
+    for image_index in range(0 if device_peaks else batch_size):
         fields = host_fields[image_index]
         peak_support = peak_support_by_image[image_index]
         base_heat = (

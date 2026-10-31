@@ -42,6 +42,10 @@ class LiveConfig:
     gru_execution: str = "dynamic"
     gru_check_interval: int = 8
     hydra_batch_size: int | None = None
+    hydra_execution: str = "eager"
+    crop_streams: int = 1
+    gru_streams: int = 1
+    gru_compile: bool = False
 
     def __post_init__(self):
         validate_hydra_batch_size(self.hydra_batch_size)
@@ -56,8 +60,22 @@ class LiveConfig:
             raise ValueError("starseg_half requires CUDA")
         if self.hydra_output_mode not in ("full", "minimal"):
             raise ValueError("hydra_output_mode must be full or minimal")
-        if self.gru_execution not in ("dynamic", "fixed"):
-            raise ValueError("gru_execution must be dynamic or fixed")
+        if self.gru_execution not in ("dynamic", "fixed", "graph"):
+            raise ValueError("gru_execution must be dynamic, fixed or graph")
+        if self.gru_execution == "graph" and device.type != "cuda":
+            raise ValueError("gru_execution graph requires CUDA")
+        if (isinstance(self.crop_streams, bool) or not isinstance(self.crop_streams, int)
+                or not 1 <= self.crop_streams <= 4 or (self.crop_streams > 1 and device.type != "cuda")):
+            raise ValueError("crop_streams must be an integer from 1 to 4; above 1 requires CUDA")
+        if (isinstance(self.gru_streams, bool) or not isinstance(self.gru_streams, int) or not 1 <= self.gru_streams <= 8
+                or (self.gru_streams > 1 and (self.gru_execution != "graph" or self.crop_streams > 1))):
+            raise ValueError("gru_streams must be an integer from 1 to 8; above 1 requires graph GRU without crop streams")
+        if self.gru_compile is not False and (self.gru_compile is not True or self.gru_execution != "graph"):
+            raise ValueError("gru_compile requires gru_execution graph")
+        if self.hydra_execution not in ("eager", "graph"):
+            raise ValueError("hydra_execution must be eager or graph")
+        if self.hydra_execution == "graph" and (device.type != "cuda" or self.hydra_output_mode != "minimal"):
+            raise ValueError("hydra_execution graph requires CUDA and minimal Hydra outputs")
         if (isinstance(self.gru_check_interval, bool) or not isinstance(self.gru_check_interval, int)
                 or not 1 <= self.gru_check_interval <= 128):
             raise ValueError("gru_check_interval must be an integer between 1 and 128")
@@ -421,10 +439,20 @@ def parse_args(argv=None):
     parser.add_argument("--channels-last", action="store_true")
     parser.add_argument("--hydra-output-mode", choices=("full", "minimal"), default="full",
                         help="Opt-in minimal mode retains raw GRU fields and only two maps for live arm tracking")
-    parser.add_argument("--gru-execution", choices=("dynamic", "fixed"), default="dynamic",
-                        help="Experimental fixed mode keeps all seed slots; dynamic remains the reference")
+    parser.add_argument("--gru-execution", choices=("dynamic", "fixed", "graph"), default="dynamic",
+                        help="Experimental fixed mode keeps all seed slots; graph replays fixed-slot steps from "
+                             "CUDA graphs with device peak candidates; dynamic remains the reference")
     parser.add_argument("--gru-check-interval", type=int, default=8,
-                        help="Fixed mode checks aggregate termination every N steps (1-128); ignored by dynamic mode")
+                        help="Fixed/graph modes check aggregate termination every N steps (1-128); ignored by dynamic mode")
+    parser.add_argument("--hydra-execution", choices=("eager", "graph"), default="eager",
+                        help="Experimental: replay minimal-mode Hydra forwards from CUDA graphs")
+    parser.add_argument("--gru-streams", type=int, default=1,
+                        help="Experimental: roll out a frame's crops' GRU graphs concurrently on CUDA streams (1-8)")
+    parser.add_argument("--crop-streams", type=int, default=1,
+                        help="Experimental: run up to N crop groups of one frame concurrently on CUDA streams (1-4)")
+    parser.add_argument("--gru-compile", action="store_true",
+                        help="Experimental: torch.compile the GRU step before graph capture (requires --gru-execution "
+                             "graph); not byte-identical to the eager step")
     args = parser.parse_args(argv)
     try:
         config = LiveConfig(**{name: getattr(args, name) for name in LiveConfig.__dataclass_fields__})

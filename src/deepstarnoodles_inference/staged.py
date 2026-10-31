@@ -34,6 +34,11 @@ def parse_args(argv=None):
     args = b.parse_args(rest)
     if args.archive_frame_window:
         raise ValueError("--archive-frame-window is resident archive-only; staged scheduling already buffers disk shards")
+    if (getattr(args, "detect_ahead", 0) or getattr(args, "archive_processes", 1) != 1
+            or getattr(args, "crop_streams", 1) != 1 or getattr(args, "gru_streams", 1) != 1):
+        raise ValueError("--detect-ahead, --archive-processes and --crop-streams are resident-only")
+    if getattr(args, "hydra_execution", "eager") != "eager":
+        raise ValueError("--hydra-execution graph is resident-only; staged Hydra forwards stay eager")
     if args.mode != "archive" or args.warmup != 0:
         raise ValueError("staged-archive requires --mode archive --warmup 0; stage startup is part of its job cost")
     if extra.shard_size < 1 or not np.isfinite(extra.max_spool_gib) or extra.max_spool_gib <= 0:
@@ -137,14 +142,22 @@ def run_shard(args, model_paths, paths, frame_start, spool, timer, state):
         if tracer.hidden_size != 128:
             raise ValueError("expected GRU128")
         arm_count = 0
+        graph_rollout = None
         for group in b.chunks(entries, args.crop_batch_size):
             raws = torch.from_numpy(np.stack([np.load(spool / f"{e['stem']}_raw.npy", allow_pickle=False) for e in group])).to(timer.device)
             images = torch.from_numpy(np.stack([np.load(spool / f"{e['stem']}_image.npy", allow_pickle=False) for e in group])).to(timer.device)
-            if getattr(args, "gru_execution", "dynamic") == "fixed":
+            execution = getattr(args, "gru_execution", "dynamic")
+            if execution in ("fixed", "graph"):
                 from .noodle_tracer_fixed import trace_arms_noodle_batch_fixed_slots
+                if execution == "graph" and graph_rollout is None:
+                    from .noodle_tracer_graph import FixedSlotGraphRollout
+                    graph_rollout = FixedSlotGraphRollout(
+                        tracer, trace_params, steps_per_replay=getattr(args, "gru_check_interval", 8))
+                graph_options = ({"graph_rollout": graph_rollout, "device_peaks": True}
+                                 if execution == "graph" else {})
                 decoded = trace_arms_noodle_batch_fixed_slots(
                     raws, images, tracer, trace_params,
-                    check_interval=getattr(args, "gru_check_interval", 8))
+                    check_interval=getattr(args, "gru_check_interval", 8), **graph_options)
             else:
                 decoded = trace_arms_noodle_batch(raws, images, tracer, trace_params)
             for entry, arms in zip(group, decoded):
