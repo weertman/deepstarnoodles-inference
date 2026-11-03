@@ -1,5 +1,8 @@
-# Vendored from DeepStarNoodles tests/test_noodle_polylines_parity.py at f749a49; only imports and fixture paths
-# changed (see UPSTREAM.json "noodle_polylines").
+# Vendored from DeepStarNoodles tests/test_noodle_polylines_parity.py at f749a49; imports and fixture paths
+# changed (see UPSTREAM.json "noodle_polylines"), and the SVD-Kabsch deformation is checked against the stored
+# golden fixtures with `golden_svd` (rtol 1e-12) instead of bit-for-bit. LAPACK's SVD differs in the last
+# bits between numpy builds (2.5.4 / scipy 1.18.1 give up to 4e-15 off the fixtures, which pyproject allows).
+# Every comparison against the in-process reference stays bit-exact.
 """Public noodle_polylines API == _reference (figure-script ports) == golden fixtures, on the micro example."""
 from __future__ import annotations
 
@@ -25,6 +28,11 @@ def same(a, b):
     a, b = np.asarray(a), np.asarray(b)
     assert a.shape == b.shape, (a.shape, b.shape)
     assert np.array_equal(a, b, equal_nan=a.dtype.kind == 'f'), np.nanmax(np.abs(a.astype(float) - b.astype(float)))
+
+
+def golden_svd(a, b):
+    """SVD-Kabsch values vs fixtures stored by another numpy/LAPACK build: NaN positions exact, rtol 1e-12."""
+    close(a, b, rtol=1e-12)
 
 
 def close(a, b, rtol=1e-9):
@@ -234,7 +242,7 @@ def test_fig4e_equals_reference_and_fixture(c, fx, tables, relink_ids):
                'arm_deformation': KI.arm_deformation(c, res.r0, relink_ids, lag='prev_frame_reset', kabsch='svd')}
         for name, v in got.items():
             same(v[win], np.asarray(ref['columns'][name]))
-            same(v[win], fr[f'fig4e_{name}'][sel])
+            (golden_svd if name == 'arm_deformation' else same)(v[win], fr[f'fig4e_{name}'][sel])
         close(KI.arm_deformation(c, res.r0, relink_ids, lag='prev_frame_reset')[win], fr['fig4e_arm_deformation'][sel])
 
 
@@ -261,9 +269,10 @@ def test_fig4d_equals_reference_and_fixture(c, fx, tables, relink_ids):
                                kabsch='svd')
         logd = np.array([np.nan if not np.isfinite(x) else float(np.log10(max(float(x), 1e-3))) for x in d])
         same(logd[win], np.asarray(ref['columns']['log_deformation'])[sel])
-        same(logd[win], fr['fig4d_log_deformation'][fsel])
-        same(out['log_deformation'][win], fr['fig4d_log_deformation'][fsel])
-        same(out['log_deformation_window'][i][win], fr['fig4d_log_deformation'][fsel])
+        golden_svd(logd[win], fr['fig4d_log_deformation'][fsel])
+        same(out['log_deformation'][win], logd[win])
+        golden_svd(out['log_deformation'][win], fr['fig4d_log_deformation'][fsel])
+        same(out['log_deformation_window'][i][win], logd[win])
         close(out_c['log_deformation'][win], fr['fig4d_log_deformation'][fsel])
 
 
@@ -276,7 +285,7 @@ def test_fig5_definitions_equal_reference_and_fixture(c, fx, relink_ids):
         out = compute_all(c, 'fig5', r0=r0, track='relink', kabsch='svd')
         for name in ('fold_asymmetry', 'arm_length_spread', 'arm_curvature', 'tip_motion', 'arm_deformation'):
             same(out[name], np.asarray(ref['rows'][name]))
-            same(out[name], fr[f'fig5_{tag}_{name}'])
+            (golden_svd if name == 'arm_deformation' else same)(out[name], fr[f'fig5_{tag}_{name}'])
         out_c = compute_all(c, 'fig5', r0=r0, track='relink')
         close(out_c['arm_deformation'], fr[f'fig5_{tag}_arm_deformation'])
         for name in ('fold_asymmetry', 'arm_length_spread', 'arm_curvature', 'tip_motion'):
