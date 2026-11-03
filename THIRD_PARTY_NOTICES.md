@@ -8,4 +8,6 @@ The unmodified `src/deepstarnoodles_inference/_vendor/dinov3/convnext.py` is cop
 
 PyTorch, torchvision, NumPy, SciPy, Pillow, OpenCV, and other installed dependencies retain their own licenses and notices. The torchvision MobileNetV3 architecture is used by the tracer; its trained encoder weights come from the explicitly supplied tracer checkpoint. No pretrained model weights are distributed in this repository or wheel, and inference does not download initialization weights.
 
+`src/deepstarnoodles_inference/_vendor/noodle_polylines/` is an unmodified copy of DeepStarNoodles `CORE/noodle_polylines` (copyright 2026 Weertman, MIT).
+
 `UPSTREAM.json` records source-file hashes at extraction. Runtime changes remove research-checkout paths and training imports while retaining checkpoint tensor names and normalization/decoding behavior.

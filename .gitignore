@@ -29,3 +29,5 @@ outputs/
 credentials*
 *.pem
 *.key
+# Pinned noodle_polylines test data (hashes in UPSTREAM.json)
+!tests/fixtures/polylines/*.npz
