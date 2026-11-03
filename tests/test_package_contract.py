@@ -91,3 +91,14 @@ def test_staged_cli_selects_archive_and_no_warmup(monkeypatch):
     monkeypatch.setattr(staged, "main", lambda argv: received.append(staged.parse_args(argv)) or 0)
     assert cli.main(["staged-archive", "--models", "models", "--index", "images.csv", "--output", "out", "--device", "cpu"]) == 0
     assert received[0].mode == "archive" and received[0].warmup == 0
+
+
+def test_version_matches_pyproject_and_representations_is_routed(capsys):
+    import re
+    import deepstarnoodles_inference
+
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    assert re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1) == deepstarnoodles_inference.__version__
+    with pytest.raises(SystemExit) as stopped:
+        cli.main(["representations", "--help"])
+    assert stopped.value.code == 0 and "--untracked" in capsys.readouterr().out
