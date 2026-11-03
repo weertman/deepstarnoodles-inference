@@ -748,7 +748,8 @@ def parse_args(argv=None):
     p.add_argument("--parse-all-values", action="store_true",
                    help="parse the unused source-pixel arrays too (slower; reports malformed numbers in them)")
     p.add_argument("--overwrite", action="store_true", help="write into an existing output directory")
-    p.add_argument("--name", default=None, help="input name for stdin")
+    p.add_argument("--name", default=None,
+                   help="name for the one input (stdin or a single file) instead of its stem; refused with several")
     args = p.parse_args(argv)
     if args.fps is not None and (not math.isfinite(args.fps) or args.fps <= 0):
         p.error("--fps must be finite and positive")
@@ -769,6 +770,11 @@ def main(argv=None) -> int:
         parser.error(str(exc))
     if not inputs:
         parser.error("no input files found")
+    if args.name is not None:
+        if len(inputs) != 1:
+            parser.error(f"--name names a single input, but {len(inputs)} inputs were found")
+        if not args.name or args.name in (".", "..") or "/" in args.name or "\\" in args.name:
+            parser.error("--name must be a plain file-name stem (no path separators)")
     if "-" in inputs and args.workers > 1:
         args.workers = 1
     context = None
@@ -790,7 +796,7 @@ def main(argv=None) -> int:
                "bout": None if args.bout is None else dict(zip(("first_time_s", "last_time_s", "flip_start_s"),
                                                                 args.bout)),
                "windows": windows, "context": context}
-    names = input_names(inputs, args.name)
+    names = [args.name] if args.name is not None else input_names(inputs)
     jobs = [{"path": path, "name": name, "options": options, "output": str(args.output)}
             for path, name in zip(inputs, names)]
     manifest = {"schema_version": 1, "command": "representations", "argv": argv,

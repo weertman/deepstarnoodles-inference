@@ -365,6 +365,24 @@ def test_cli_reads_stdin(tmp_path, example, monkeypatch):
     assert (tmp_path / "s" / "fig6_flipping" / "piped__star3.npz").is_file()
 
 
+def test_cli_name_applies_to_one_file_and_is_refused_otherwise(tmp_path, example):
+    records = records_from(example.select_frames(slice(0, 5)))
+    for sub in ("a", "b"):
+        (tmp_path / "in" / sub).mkdir(parents=True)
+    write_jsonl(tmp_path / "in" / "a" / "predictions.jsonl", records)
+    write_jsonl(tmp_path / "in" / "b" / "predictions.jsonl", records)
+    one = tmp_path / "in" / "a" / "predictions.jsonl"
+    assert run_cli(one, "--output", tmp_path / "s", "--name", "clip7", "--preset", "fig6_flipping") == 0
+    assert (tmp_path / "s" / "fig6_flipping" / "clip7__star3.npz").is_file()
+    assert not (tmp_path / "s" / "fig6_flipping" / "a__star3.npz").exists()
+    with pytest.raises(SystemExit):          # several inputs: --name would be ambiguous, not silently dropped
+        run_cli(tmp_path / "in", "--output", tmp_path / "t", "--name", "clip7")
+    assert not (tmp_path / "t").exists()
+    for bad in ("../escape", "x/y", "..", ""):
+        with pytest.raises(SystemExit):
+            run_cli(one, "--output", tmp_path / "u", "--name", bad)
+
+
 def test_input_names_and_discovery(tmp_path):
     for rel in ("a/predictions.jsonl", "b/predictions.jsonl.zst", "c.jsonl.gz", "c.jsonl", "d/worker.0.json",
                 "d/x.jsonl.part", "d/report.json"):

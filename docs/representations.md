@@ -55,7 +55,7 @@ For a tracked star, every frame between its first and last appearance where it i
 
 ## Inputs and outputs
 
-Inputs can be files (`.json`, `.jsonl`, plain or `.gz`, `.bz2`, `.xz` or `.zst`), directories, globs or `-` for stdin. Directories are searched recursively for `*.jsonl*`, skipping `.part`, `report.json`, `worker.*.json` and `service.json`. Reading `.zst` needs Python 3.14 or `pip install deepstarnoodles-inference[representations]` (zstandard); otherwise pipe through `zstd -dc`. An input is named by its stem; `predictions.jsonl` takes its directory's name. Each star becomes a sequence named `<input>__star<id>`.
+Inputs can be files (`.json`, `.jsonl`, plain or `.gz`, `.bz2`, `.xz` or `.zst`), directories, globs or `-` for stdin. Directories are searched recursively for `*.jsonl*`, skipping `.part`, `report.json`, `worker.*.json` and `service.json`. Reading `.zst` needs Python 3.14 or `pip install deepstarnoodles-inference[representations]` (zstandard); otherwise pipe through `zstd -dc`. An input is named by its stem; `predictions.jsonl` takes its directory's name. `--name NAME` overrides this when there is exactly one input (stdin or one file) and is refused with several. Each star becomes a sequence named `<input>__star<id>`.
 
 The output directory must be new unless `--overwrite` is given. It holds:
 
