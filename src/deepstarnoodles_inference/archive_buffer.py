@@ -18,6 +18,7 @@ import numpy as np
 from . import benchmark as b
 from .archive_decode import ArchiveSourceGroups
 from .crop import _crop_result, _square_crop_geometry
+from .records import finalize_frame
 
 
 class ArchiveCropBuffer:
@@ -111,7 +112,7 @@ class ArchiveCropBuffer:
                 index = next(iter(self.records))
                 if self.remaining[index]:
                     break
-                record = self.records[index]
+                record = finalize_frame(self.records[index], getattr(self.args, "fps", None))
                 self.sink.write(json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n")
                 self.emitted += 1
                 self.empty += not record["stars"]

@@ -115,7 +115,8 @@ def fake_models(monkeypatch):
 
         def predict_tensor_batch_raw(self, images):
             witness.events.append(("hydra_forward", len(images)))
-            raw = images[:, :1] + 0.125
+            # Eighteen channels like Hydra: support (0) and mouth (5) feed the body fields.
+            raw = (images[:, :1] + 0.125).repeat(1, 18, 1, 1)
             raw._model_owner = self
             return raw
 
@@ -133,7 +134,7 @@ def fake_models(monkeypatch):
     def trace(raw, images, tracer, params):
         assert raw.dtype == images.dtype == torch.float32
         assert tuple(images.shape[1:]) == (3, 512, 512)
-        torch.testing.assert_close(raw, images[:, :1] + 0.125, rtol=0, atol=0)
+        torch.testing.assert_close(raw, (images[:, :1] + 0.125).repeat(1, 18, 1, 1), rtol=0, atol=0)
         witness.events.append(("trace", len(images)))
         answer = []
         for field, image in zip(raw, images):

@@ -62,17 +62,17 @@ class CropStreams:
             device = self.cascade.device
             with torch.inference_mode(), torch.cuda.device(device), torch.cuda.stream(workspace.stream):
                 crop_group, images = job(workspace)
-                activated, decoded = self.cascade.compute_crops(
+                activated, decoded, bodies = self.cascade.compute_crops(
                     crop_group, images, Timer(device, False), workspace)
                 # Results (including live tracking maps) are complete before the
                 # consumer reads them on another stream.
                 workspace.stream.synchronize()
-            return crop_group, activated, decoded
+            return crop_group, activated, decoded, bodies
         finally:
             self._free.put(workspace)
 
     def map(self, jobs):
-        """Yield ``(crop_group, activated, decoded)`` in job order."""
+        """Yield ``(crop_group, activated, decoded, bodies)`` in job order."""
         futures = [self._pool.submit(self._run, job) for job in jobs]
         try:
             for future in futures:

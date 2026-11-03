@@ -61,6 +61,7 @@ def test_ndarray_cascade_all_zero_remainder_and_source_gaps(monkeypatch):
                                 acquisition_clock="opencv_read_completed")
                for count, index in [(3, 10), (0, 14), (1, 19)]]
     assert [r["frame"] for r in records] == [10, 14, 19]
+    assert all(r["time_s"] is None and r["fps"] is None and r["schema_version"] == 3 for r in records)
     assert [r["processed_index"] for r in records] == [0, 1, 2]
     assert [r["skipped_source_indices_since_previous"] for r in records] == [0, 3, 4]
     assert [len(r["stars"]) for r in records] == [3, 0, 1]
@@ -77,6 +78,17 @@ def test_ndarray_cascade_all_zero_remainder_and_source_gaps(monkeypatch):
         assert record["inference_started_monotonic_ns"] <= record["inference_ended_monotonic_ns"]
     assert pipeline.report()["processed_frames"] == 3
     assert pipeline.report()["star_crops"] == 4
+
+
+def test_predict_times_records_from_the_source_index(monkeypatch):
+    pipeline, events = live_pipeline(monkeypatch)
+    with pytest.raises(ValueError, match="fps"):
+        pipeline.predict(pixels(1), source_index=20, fps=0.0)
+    assert events == [] and pipeline.processed == 0
+    timed = pipeline.predict(pixels(1), source_index=21, fps=2.0)
+    assert (timed["time_s"], timed["fps"], list(timed)[-1]) == (10.5, 2.0, "schema_version")
+    assert list(timed["stars"][0])[-4:] == ["body_origin_model", "body_origin_code", "support_area_model_px",
+                                            "support_centroid_model"]
 
 
 def test_ndarray_and_file_replay_have_identical_geometry_and_ids(tmp_path, monkeypatch):
@@ -126,9 +138,13 @@ def test_live_minimal_and_full_preserve_geometry_and_actual_tracking(monkeypatch
         outputs.append(records)
         assert pipeline.cascade.registry.star_track_ids == (7, 8, 9)
     for full, minimal in zip(*outputs):
+        # Includes the body fields: the compact maps give the same origin, area and centroid.
         assert full["stars"] == minimal["stars"]
         assert full["source_shape"] == minimal["source_shape"]
         assert full["processed_index"] == minimal["processed_index"]
+    star = outputs[1][0]["stars"][0]
+    assert (star["body_origin_model"], star["body_origin_code"]) == ([9.0, 8.0], 0)
+    assert (star["support_area_model_px"], star["support_centroid_model"]) == (0, None)
     # Re-observing a star after an empty frame retains its real FusedTracker ID.
     for first, last in zip(outputs[1][0]["stars"], outputs[1][2]["stars"]):
         assert first["arms"][0]["track_id"] == last["arms"][0]["track_id"]
@@ -490,5 +506,10 @@ def test_cli_video_streams_ndarrays_and_reports_cleanup(tmp_path, monkeypatch, f
     assert report["capture"]["overwritten_pending_frames"] == 0
     assert [row["source_index"] for row in rows] == list(range(len(rows)))
     assert all(row["acquisition_clock"] == "opencv_read_completed" for row in rows)
+    # The video's nominal 25 fps times each source index; the time fields stay last after the CLI keys.
+    assert [row["time_s"] for row in rows] == [index / 25.0 for index in range(len(rows))]
+    assert all(list(row)[-5:] == ["capture_read_ms", "queue_overwritten_total_at_result", "time_s", "fps",
+                                  "schema_version"] and row["fps"] == 25.0 for row in rows)
+    assert report["output_schema_version"] == 3
     assert report["serialize_write"]["samples"] == len(rows)
     assert report["total_job_seconds"] > 0

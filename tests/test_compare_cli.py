@@ -146,3 +146,22 @@ def test_module_entrypoint_exit_codes_and_no_model_imports(pair):
                              capture_output=True, text=True, check=False)
     assert process.returncode == 1
     assert json.loads(process.stdout)["parity"]["pass"] is False
+
+
+def test_dev10_reference_against_schema3_candidate_passes(pair, capsys):
+    paths, record = pair
+    upgraded = deepcopy(record)
+    upgraded["stars"][0].update(body_origin_model=[256.0, 256.0], body_origin_code=2,
+                                support_area_model_px=0, support_centroid_model=None)
+    upgraded.update(time_s=None, fps=None, schema_version=3)
+    paths[1].write_text(json.dumps(upgraded) + "\n")
+    assert cli.main(args(paths)) == 0
+    parity = json.loads(capsys.readouterr().out)["parity"]
+    assert parity["pass"] is True and parity["new_fields_compared"] == 0
+    changed = deepcopy(upgraded)
+    changed["stars"][0]["body_origin_code"] = 0
+    paths[0].write_text(json.dumps(upgraded) + "\n")
+    paths[1].write_text(json.dumps(changed) + "\n")
+    assert cli.main(args(paths)) == 1
+    parity = json.loads(capsys.readouterr().out)["parity"]
+    assert {issue["kind"] for issue in parity["issues_first_100"]} == {"body_origin_code"}

@@ -17,7 +17,11 @@ DEFAULT_TOLERANCES = {"bbox_pixels": 1.0, "polyline_crop_pixels": 1.0,
                       "identity_l2": 0.01, "confidence": 0.01,
                       "source_mapping_pixels": 0.01, "length_px": 1.0,
                       "mask_iou": 0.99, "require_same_steps": True,
-                      "require_same_stop_reason": True}
+                      "require_same_stop_reason": True,
+                      # Schema-3 fields, compared only when both records carry them.
+                      "body_origin_pixels": 1.0, "support_centroid_pixels": 1.0,
+                      "support_area_fraction": 0.01, "require_same_body_origin_code": True,
+                      "time_s": 1e-9}
 
 
 def mask_iou(left, right, source_shape):
@@ -39,10 +43,36 @@ def mask_iou(left, right, source_shape):
     return float(np.logical_and(a, b).sum() / union) if union else 1.0
 
 
+def compare_body(sa, sb, frame, tolerance, issue, numeric):
+    """Compare the schema-3 star fields present in both records; returns how many were compared."""
+    compared = 0
+    if "body_origin_code" in sa and "body_origin_code" in sb:
+        compared += 1
+        if tolerance["require_same_body_origin_code"] and sa["body_origin_code"] != sb["body_origin_code"]:
+            issue("body_origin_code", frame)
+    if "body_origin_model" in sa and "body_origin_model" in sb:
+        compared += 1
+        numeric("body_origin_pixels", float(np.linalg.norm(np.subtract(sa["body_origin_model"],
+                                                                       sb["body_origin_model"]))), frame)
+    if "support_area_model_px" in sa and "support_area_model_px" in sb:
+        compared += 1
+        left, right = sa["support_area_model_px"], sb["support_area_model_px"]
+        numeric("support_area_fraction", abs(left - right) / max(left, right, 1), frame)
+    if "support_centroid_model" in sa and "support_centroid_model" in sb:
+        compared += 1
+        left, right = sa["support_centroid_model"], sb["support_centroid_model"]
+        if (left is None) != (right is None):
+            issue("support_centroid_model", frame)
+        elif left is not None:
+            numeric("support_centroid_pixels", float(np.linalg.norm(np.subtract(left, right))), frame)
+    return compared
+
+
 def _compare(reference, candidate, tolerances=None):
     tolerance = {**DEFAULT_TOLERANCES, **(tolerances or {})}
-    issues, count, issue_count = [], 0, 0
-    maxima = {k: 0.0 for k in ("bbox_pixels", "polyline_crop_pixels", "identity_l2", "confidence", "source_mapping_pixels", "length_px")}
+    issues, count, issue_count, new_fields = [], 0, 0, 0
+    maxima = {k: 0.0 for k in ("bbox_pixels", "polyline_crop_pixels", "identity_l2", "confidence", "source_mapping_pixels", "length_px",
+                               "body_origin_pixels", "support_centroid_pixels", "support_area_fraction", "time_s")}
     minimum_mask_iou = 1.0
 
     def issue(kind, frame):
@@ -70,6 +100,12 @@ def _compare(reference, candidate, tolerances=None):
             if (a["frame"], a["image_path"], a["source_shape"]) != (b["frame"], b["image_path"], b["source_shape"]):
                 issue("source_mapping", frame)
                 continue
+            if "time_s" in a and "time_s" in b:
+                new_fields += 1
+                if (a["time_s"] is None) != (b["time_s"] is None):
+                    issue("time_s", frame)
+                elif a["time_s"] is not None:
+                    numeric("time_s", abs(a["time_s"] - b["time_s"]), frame)
             if len(a["stars"]) != len(b["stars"]):
                 issue("star_count", frame)
                 continue
@@ -86,6 +122,7 @@ def _compare(reference, candidate, tolerances=None):
                     numeric("bbox_pixels", abs(sa["crop"][field] - sb["crop"][field]), frame)
                 if sa.get("star_track_id") != sb.get("star_track_id"):
                     issue("star_track_id", frame)
+                new_fields += compare_body(sa, sb, frame, tolerance, issue, numeric)
                 iou = mask_iou(sa["mask_polygon_source"], sb["mask_polygon_source"], a["source_shape"])
                 minimum_mask_iou = min(minimum_mask_iou, iou)
                 if iou < tolerance["mask_iou"]:
@@ -136,6 +173,7 @@ def _compare(reference, candidate, tolerances=None):
                             numeric("length_px", abs(x[field] - y[field]), frame)
     return {"pass": issue_count == 0 and count > 0, "frames": count, "issue_count": issue_count,
             "issues_first_100": issues, "maxima": maxima, "minimum_mask_iou": minimum_mask_iou,
+            "new_fields_compared": new_fields,
             "tolerances": tolerance, "scope": "runtime output parity screening, not task accuracy"}
 
 

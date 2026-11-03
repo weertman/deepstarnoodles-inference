@@ -13,8 +13,8 @@ from deepstarnoodles_inference import video_service
 from test_benchmark_cascade import Boxes, make_pipeline
 
 
-def write_video(path, frames=6, size=(64, 48)):
-    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), 1.0, size)
+def write_video(path, frames=6, size=(64, 48), fps=1.0):
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, size)
     assert writer.isOpened()
     for index in range(frames):
         frame = np.full((size[1], size[0], 3), 20 * index, dtype=np.uint8)
@@ -78,6 +78,12 @@ def test_annotate_video_writes_one_record_per_frame(tmp_path, monkeypatch, ahead
     assert {record["video"] for record in records} == {"clip"}
     assert [record["image_path"] for record in records] == [f"clip#{i:06d}" for i in range(6)]
     assert all(len(record["stars"]) == 1 for record in records)
+    assert [record["time_s"] for record in records] == [float(i) for i in range(6)]
+    assert all(list(record)[-4:] == ["video", "time_s", "fps", "schema_version"] for record in records)
+    assert all(list(record["stars"][0])[-4:] == ["body_origin_model", "body_origin_code",
+                                                 "support_area_model_px", "support_centroid_model"]
+               for record in records)
+    assert summary["fps"] == 1.0
 
 
 def test_annotate_video_passes_the_worker_stream_to_detect_ahead(tmp_path, monkeypatch):
@@ -121,7 +127,20 @@ def test_service_options_validation(tmp_path):
     base = ["--queue", str(tmp_path / "q"), "--output", str(tmp_path / "o"), "--models", "m"]
     args, rest, runtime = video_service.parse_args(base + ["--processes", "8", "--gpu-crops", "--detect-ahead", "2"])
     assert args.processes == 8 and runtime.gpu_crops and runtime.detect_ahead == 2 and "--gpu-crops" in rest
-    for extra in (["--processes", "0"], ["--processes", "17"], ["--decode-workers", "2"],
+    for extra in (["--processes", "0"], ["--processes", "17"], ["--decode-workers", "2"], ["--fps", "2"],
                   ["--gru-execution", "graph", "--gru-streams", "2"], ["--archive-processes", "2"]):
         with pytest.raises(SystemExit):
             video_service.parse_args(base + extra)
+
+
+def test_video_frames_expose_the_nominal_frame_rate(tmp_path):
+    path = write_video(tmp_path / "clip.avi", frames=3, fps=5.0)
+    with video_service.VideoFrames(path, "clip", prefetch=1) as source:
+        assert next(source)[0] == ["clip#000000"]
+        assert source.fps == 5.0
+        list(source)
+    record = video_service.frame_record({"frame": 0, "image_path": "clip#000002", "source_shape": [48, 64],
+                                         "stars": []}, "clip", source.fps)
+    assert record == {"frame": 2, "image_path": "clip#000002", "source_shape": [48, 64], "stars": [],
+                      "video": "clip", "time_s": 0.4, "fps": 5.0, "schema_version": 3}
+    assert video_service.frame_record({"frame": 0, "image_path": "clip#000002", "stars": []}, "clip")["time_s"] is None

@@ -157,3 +157,47 @@ def test_changed_source_mapping_fails(tmp_path, records):
     candidate = deepcopy(records)
     candidate[0]["image_path"] = "/inputs/a_different_frame.png"
     assert gate(tmp_path, records, candidate)["pass"] is False
+
+
+def with_schema3(records):
+    upgraded = deepcopy(records)
+    for record in upgraded:
+        for index, star in enumerate(record["stars"]):
+            star.update(body_origin_model=[256.0 + index, 250.0], body_origin_code=0,
+                        support_area_model_px=4000 + index, support_centroid_model=[255.5, 251.25])
+        record.update(time_s=record["frame"] / 2.0, fps=2.0, schema_version=3)
+    return upgraded
+
+
+@pytest.mark.parametrize("change,kind", [
+    (lambda r: r[0]["stars"][0]["body_origin_model"].__setitem__(0, 258.0), "body_origin_pixels"),
+    (lambda r: r[0]["stars"][0].__setitem__("body_origin_code", 1), "body_origin_code"),
+    (lambda r: r[0]["stars"][0].__setitem__("support_area_model_px", 4100), "support_area_fraction"),
+    (lambda r: r[0]["stars"][0]["support_centroid_model"].__setitem__(1, 253.0), "support_centroid_pixels"),
+    (lambda r: r[0]["stars"][0].__setitem__("support_centroid_model", None), "support_centroid_model"),
+    (lambda r: r[0].__setitem__("time_s", 0.5), "time_s"),
+    (lambda r: r[0].__setitem__("time_s", None), "time_s"),
+])
+def test_schema3_fields_have_gates(tmp_path, records, change, kind):
+    reference = with_schema3(records)
+    assert gate(tmp_path, reference, deepcopy(reference))["pass"] is True
+    candidate = deepcopy(reference)
+    change(candidate)
+    result = gate(tmp_path, reference, candidate)
+    assert result["pass"] is False
+    assert {issue["kind"] for issue in result["issues_first_100"]} == {kind}
+
+
+def test_legacy_and_schema3_outputs_compare_on_shared_fields(tmp_path, records):
+    upgraded = with_schema3(records)
+    for reference, candidate in ((records, upgraded), (upgraded, records), (records, records)):
+        result = gate(tmp_path, reference, candidate)
+        assert result["pass"] is True and result["new_fields_compared"] == 0
+    result = gate(tmp_path, upgraded, deepcopy(upgraded))
+    assert result["new_fields_compared"] == 1 + 4 * len(upgraded[0]["stars"])
+    small = deepcopy(upgraded)
+    small[0]["stars"][0]["body_origin_model"][0] += 0.5
+    small[0]["stars"][0]["support_area_model_px"] += 20
+    result = gate(tmp_path, upgraded, small)
+    assert result["pass"] is True
+    assert result["maxima"]["body_origin_pixels"] == 0.5

@@ -8,7 +8,8 @@ by renaming them into ``<queue>/work/<worker>/`` (a rename succeeds for exactly
 one claimant), decodes every frame and runs the archive cascade on each frame
 independently. One JSON record per frame is appended to
 ``<output>/<video>.jsonl.part`` and flushed, so a reader can stream records as
-they appear; ``image_path`` is ``<video>#<frame index>``. A finished video's
+they appear; ``image_path`` is ``<video>#<frame index>``, and ``time_s`` is the frame index over the
+video's nominal frame rate (``fps``; both null when the container reports none). A finished video's
 records are renamed to ``.jsonl`` and the video is deleted, so the queue acts as
 a rolling cache of not-yet-annotated videos. A ``STOP`` file in the queue ends
 every worker after its current frame and leaves partial records in place.
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -27,6 +29,8 @@ import subprocess
 import sys
 import threading
 import time
+
+from .records import finalize_frame
 
 SUFFIXES = (".mp4", ".mkv", ".mov", ".avi")
 
@@ -38,6 +42,7 @@ class VideoFrames:
         self.path, self.name = Path(path), name
         self.stop = stop or (lambda: False)
         self.frames = 0
+        self.fps: float | None = None  # nominal frame rate, set by the decoder before the first frame
         self.decode_seconds = 0.0
         self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(prefetch)))
         self._halt = threading.Event()
@@ -73,6 +78,9 @@ class VideoFrames:
         try:
             if not capture.isOpened():
                 raise ValueError(f"could not open video: {self.path}")
+            fps = capture.get(cv2.CAP_PROP_FPS)
+            # Written before the first frame is queued; the queue orders it before any consumer read.
+            self.fps = float(fps) if math.isfinite(fps) and fps > 0 else None
             index = 0
             while not self._halt.is_set():
                 started = time.perf_counter()
@@ -123,10 +131,14 @@ def claim(queue_dir: Path, worker: int, prefix: str = ""):
     return None
 
 
-def frame_record(record: dict, name: str) -> dict:
-    """Archive record keyed by video frame: ``frame`` is the index within the video."""
+def frame_record(record: dict, name: str, fps: float | None = None) -> dict:
+    """Archive record keyed by video frame: ``frame`` is the index within the video.
+
+    The record ends with ``time_s`` (``frame / fps``, or null without a frame rate), ``fps`` and the
+    output ``schema_version`` (see ``records``).
+    """
     index = int(record["image_path"].rsplit("#", 1)[1])
-    return {**record, "frame": index, "video": name}
+    return finalize_frame({**record, "frame": index, "video": name}, fps)
 
 
 def annotate_video(pipeline, args, path: Path, name: str, sink, *, stop, stream=None) -> dict:
@@ -139,7 +151,8 @@ def annotate_video(pipeline, args, path: Path, name: str, sink, *, stop, stream=
 
     def write(records):
         for record in records:
-            sink.write(json.dumps(frame_record(record, name), separators=(",", ":"), allow_nan=False) + "\n")
+            sink.write(json.dumps(frame_record(record, name, source.fps), separators=(",", ":"),
+                                  allow_nan=False) + "\n")
         sink.flush()
 
     with VideoFrames(path, name, prefetch=args.decode_prefetch_frames, stop=stop) as source:
@@ -173,7 +186,7 @@ def annotate_video(pipeline, args, path: Path, name: str, sink, *, stop, stream=
                     break
         complete = not stop() and source.frames == frames
     return {"video": name, "frames": frames, "star_crops": crops, "arms": arms, "complete": complete,
-            "seconds": time.perf_counter() - started, "decode_seconds": source.decode_seconds}
+            "seconds": time.perf_counter() - started, "decode_seconds": source.decode_seconds, "fps": source.fps}
 
 
 def run_worker(args, runtime) -> int:
@@ -251,6 +264,8 @@ def parse_args(argv=None):
     runtime = benchmark.parse_args(["--models", str(args.models), "--index", str(args.queue / "unused.csv"),
                                     "--output", str(args.output), "--mode", "archive", "--images", "1",
                                     "--warmup", "0", *rest])
+    if runtime.fps is not None:
+        p.error("serve-videos reads each video's own frame rate; --fps is for image-index commands")
     if (runtime.archive_processes != 1 or runtime.gru_streams != 1 or runtime.detector_batch_size != 1
             or runtime.profile_stages or runtime.decode_workers):
         p.error("serve-videos takes --processes; workers use one archive process, one GRU stream, detector "

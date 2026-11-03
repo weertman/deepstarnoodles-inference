@@ -27,6 +27,7 @@ import torch
 
 from .benchmark import Cascade, Timer, host_peak_bytes, sha256, verify_models
 from .hydra import validate_hydra_batch_size
+from .records import OUTPUT_SCHEMA_VERSION, finalize_frame, validate_fps
 
 
 @dataclass(frozen=True)
@@ -163,7 +164,9 @@ class LivePipeline:
             self._lock.release()
 
     def predict(self, frame_bgr, *, source_index=None, acquired_monotonic_ns=None,
-                source_timestamp_s=None, acquisition_clock=None):
+                source_timestamp_s=None, acquisition_clock=None, fps=None):
+        """Process one frame; the record ends with ``time_s`` (``source_index / fps``, or null without
+        ``fps``), ``fps`` and the output ``schema_version``."""
         if not self._lock.acquire(blocking=False):
             raise RuntimeError("LivePipeline is already in use")
         try:
@@ -189,6 +192,7 @@ class LivePipeline:
                 raise ValueError("source_timestamp_s must be finite and nonnegative")
             if not isinstance(acquisition_clock, str):
                 raise ValueError("acquisition_clock must be a descriptive string")
+            fps = validate_fps(fps)
             timer = Timer(self.cascade.device, False)
             timer.sync()
             started = time.monotonic_ns()
@@ -213,6 +217,7 @@ class LivePipeline:
             record["timing"] = {"queue_wait_ms": (started - acquired_monotonic_ns) / 1e6,
                                 "processing_ms": (ended - started) / 1e6,
                                 "post_acquisition_result_ms": (ended - acquired_monotonic_ns) / 1e6}
+            finalize_frame(record, fps)
             for name, value in record["timing"].items():
                 self.timings[name].add(value)
             self.processed += 1
@@ -476,7 +481,8 @@ def main(argv=None):
     args, config = parse_args(argv)
     args.output.mkdir(parents=True, exist_ok=False)
     pipeline = source = None
-    report = {"schema_version": 1, "mode": "live", "status": "running", "configuration": asdict(config),
+    report = {"schema_version": 1, "output_schema_version": OUTPUT_SCHEMA_VERSION, "mode": "live",
+              "status": "running", "configuration": asdict(config),
               "source": {"camera_index": args.camera, "video_name": None if args.video is None else args.video.name},
               "inventory": {"torch": torch.__version__, "cuda_runtime": torch.version.cuda,
                             "device": config.device, "python": sys.version,
@@ -520,6 +526,8 @@ def main(argv=None):
         source = CaptureSource(camera=args.camera, video=args.video, queue_policy=args.queue_policy)
         capture_started = time.perf_counter()
         with source, (args.output / "predictions.jsonl").open("x") as sink:
+            # A video's nominal rate times its frames; a camera's nominal rate is not a clock.
+            frame_rate = source.nominal_fps if source.kind == "video" else None
             while True:
                 if args.max_frames is not None and pipeline.processed >= args.max_frames:
                     report["stop_reason"] = "max_frames"
@@ -537,9 +545,10 @@ def main(argv=None):
                 record = pipeline.predict(packet.frame_bgr, source_index=packet.source_index,
                                           acquired_monotonic_ns=packet.acquired_monotonic_ns,
                                           source_timestamp_s=packet.source_timestamp_s,
-                                          acquisition_clock="opencv_read_completed")
+                                          acquisition_clock="opencv_read_completed", fps=frame_rate)
                 record["capture_read_ms"] = packet.read_ms
                 record["queue_overwritten_total_at_result"] = source._queue.overwritten
+                finalize_frame(record, frame_rate)
                 write_started = time.perf_counter()
                 sink.write(json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n")
                 sink.flush()
