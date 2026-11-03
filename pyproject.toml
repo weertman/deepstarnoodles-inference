@@ -18,6 +18,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest==9.0.2"]
+# Reading .jsonl.zst in `representations` before Python 3.14 (or pipe through `zstd -dc`).
+representations = ["zstandard>=0.22"]
 
 [project.scripts]
 deepstarnoodles-inference = "deepstarnoodles_inference.cli:main"

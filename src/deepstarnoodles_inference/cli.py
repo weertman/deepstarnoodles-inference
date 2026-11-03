@@ -11,7 +11,7 @@ def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description="Self-contained StarSeg → Hydra → GRU inference")
     parser.add_argument("command", choices=("benchmark", "archive", "live", "live-replay", "staged-archive", "serve-videos",
-                                            "verify-models", "fetch-models", "compare", "smoke"))
+                                            "verify-models", "fetch-models", "compare", "representations", "smoke"))
     if not argv or argv[0] in ("-h", "--help"):
         parser.print_help()
         return 0
@@ -38,6 +38,10 @@ def main(argv=None):
         return run(remaining)
     if args.command == "compare":
         from .compare_cli import main as run
+        return run(remaining)
+    if args.command == "representations":
+        # Torch-free: reads inference records and writes the paper's polyline representations.
+        from .representations import main as run
         return run(remaining)
     if args.command == "live":
         from .live import main as run
