@@ -98,8 +98,14 @@ def test_device_summary_equals_host_rules(mode, channels_last, batch):
             assert fields["body_origin_model"] == origin, name
             assert fields["support_area_model_px"] == area, name
             assert fields["support_centroid_model"] == centroid, name
-            assert fields == BF.host_body_fields(host[b, 0].numpy(), host[b, mouth_channel].numpy()), name
-            assert list(fields) == list(BF.host_body_fields(host[b, 0].numpy(), host[b, 0].numpy()))
+            assert body(fields) == BF.host_body_fields(host[b, 0].numpy(), host[b, mouth_channel].numpy()), name
+            assert list(fields) == [*BF.host_body_fields(host[b, 0].numpy(), host[b, 0].numpy()), "landmarks_model"]
+            assert fields["landmarks_model"] == BF.host_landmarks(torch.sigmoid(raw[b, 5:8]).numpy()), name
+
+
+def body(fields):
+    """The schema-3 fields of a summary, without the landmarks."""
+    return {key: value for key, value in fields.items() if key != "landmarks_model"}
 
 
 def test_source_codes_and_tie_fallback(monkeypatch):
@@ -112,8 +118,8 @@ def test_source_codes_and_tie_fallback(monkeypatch):
     fields = BF.summarize(raw, None).finish()
     assert [f["body_origin_code"] for f in fields] == [0, 1, 2, 0, 0, 1]
     assert len(calls) == 3          # tie, flat tie and NaN crops use the host rule
-    assert fields[2] == {"body_origin_model": [20.0, 24.0], "body_origin_code": 2,
-                         "support_area_model_px": 0, "support_centroid_model": None}
+    assert body(fields[2]) == {"body_origin_model": [20.0, 24.0], "body_origin_code": 2,
+                               "support_area_model_px": 0, "support_centroid_model": None}
     assert fields[3]["body_origin_model"] == list(map(float, body_center_from_maps(
         torch.sigmoid(raw[3, 0]).numpy(), torch.sigmoid(raw[3, 5]).numpy())))
 
@@ -142,7 +148,8 @@ def test_cuda_summary_equals_host_rules(channels_last):
         for fields, (origin, area, centroid), b in zip(got, expected, range(len(raw))):
             assert (fields["body_origin_model"], fields["support_area_model_px"],
                     fields["support_centroid_model"]) == (origin, area, centroid)
-            assert fields == BF.host_body_fields(host[b, 0].cpu().numpy(), host[b, mouth_channel].cpu().numpy())
+            assert body(fields) == BF.host_body_fields(host[b, 0].cpu().numpy(), host[b, mouth_channel].cpu().numpy())
+            assert fields["landmarks_model"] == BF.host_landmarks(torch.sigmoid(raw[b, 5:8]).cpu().numpy())
 
 
 def test_exact_threshold_values_on_activated_maps():
@@ -167,6 +174,18 @@ def test_exact_threshold_values_on_activated_maps():
         assert got == BF.host_body_fields(s, m)
     assert [f["support_area_model_px"] for f in fields] == [1, 0, 0, 1]
     assert [f["body_origin_code"] for f in fields] == [1, 1, 0, 0]
+
+
+def test_landmarks_are_each_maps_maximum_with_its_probability():
+    raw = torch.full((2, 18, 20, 24), -6.0)
+    for channel, (y, x, value) in zip((5, 6, 7), ((3, 7, 2.0), (15, 1, -1.0), (0, 23, 0.5))):
+        raw[0, channel, y, x] = value
+    raw[1, 7, 4, 4] = float("nan")
+    first, second = (fields["landmarks_model"] for fields in BF.summarize(raw, None).finish())
+    p = lambda v: float(torch.sigmoid(torch.tensor(v, dtype=torch.float32)))
+    assert first == {"mouth": [7.0, 3.0, p(2.0)], "madreporite": [1.0, 15.0, p(-1.0)], "butthole": [23.0, 0.0, p(0.5)]}
+    # Flat maps tie everywhere: the first pixel. A non-finite map gives None.
+    assert second == {"mouth": [0.0, 0.0, p(-6.0)], "madreporite": [0.0, 0.0, p(-6.0)], "butthole": None}
 
 
 def test_first_peak_equals_find_peaks_first_row():

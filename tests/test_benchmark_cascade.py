@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from deepstarnoodles_inference import benchmark
-from deepstarnoodles_inference.body_fields import host_body_fields
+from deepstarnoodles_inference.body_fields import host_body_fields, host_landmarks
 from deepstarnoodles_inference.crop import CropConfig
 from deepstarnoodles_inference.hydra import HydraInferConfig
 from deepstarnoodles_inference.noodle_tracer import NoodleTraceParams
@@ -145,15 +145,17 @@ def test_archive_detects_crops_all_stars_without_temporal_tracking(tmp_path, mon
     assert arm["arm_index"] == 0 and "track_id" not in arm
     assert arm["stop_reason"] == "base" and arm["steps"] == 3
     assert all(star["star_track_id"] is None for record in records for star in record["stars"])
-    # Schema 3: body fields after the arms of every star, time fields last in every record.
+    # Schema 3 and 4: body fields and landmarks after the arms of every star, time fields last in every record.
     maps = np.full((16, 16), 0.5 if hydra_output_mode == "minimal" else 0.0, np.float32)
-    expected = host_body_fields(maps, maps)
+    # Landmarks always come from the raw fields (all zero logits: p 0.5 everywhere, so the first pixel).
+    expected = {**host_body_fields(maps, maps), "landmarks_model": host_landmarks(np.full((3, 16, 16), 0.5, np.float32))}
+    assert expected["landmarks_model"]["butthole"] == [0.0, 0.0, 0.5]
     for record in records:
         assert list(record)[-3:] == list(FRAME_TAIL)
         assert (record["time_s"], record["fps"], record["schema_version"]) == (record["frame"] / 4, 4.0,
                                                                               OUTPUT_SCHEMA_VERSION)
         for star in record["stars"]:
-            assert list(star)[-5:] == ["arms", *STAR_FIELDS]
+            assert list(star)[-len(STAR_FIELDS) - 1:] == ["arms", *STAR_FIELDS]
             assert {key: star[key] for key in STAR_FIELDS} == expected
     assert expected["body_origin_code"] == (0 if hydra_output_mode == "minimal" else 2)
 
@@ -212,7 +214,7 @@ def test_live_replay_tracks_each_frame_before_reading_next_and_resets(tmp_path, 
         assert star["star_track_id"] == 7
         assert star["arms"][0]["track_id"] == 42
         assert "arm_index" not in star["arms"][0]
-        assert list(star)[-4:] == list(STAR_FIELDS)
+        assert list(star)[-len(STAR_FIELDS):] == list(STAR_FIELDS)
         assert record["time_s"] is None and record["fps"] is None
 
 
@@ -329,7 +331,9 @@ def test_compute_crops_returns_body_fields_without_changing_tracking_input(monke
     assert activated.shape == (3, 2, 16, 16) and len(decoded) == len(bodies) == 3
     # The fake's compact tracking maps are zeros (not activated), and the body fields read those maps.
     maps = np.zeros((16, 16), np.float32)
-    assert bodies == [host_body_fields(maps, maps)] * 3
+    # Landmarks come from the fake's raw fields: zero logits, p 0.5 everywhere.
+    landmarks = host_landmarks(np.full((3, 16, 16), 0.5, np.float32))
+    assert bodies == [{**host_body_fields(maps, maps), "landmarks_model": landmarks}] * 3
 
 
 def test_fps_option_is_validated():

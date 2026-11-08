@@ -188,6 +188,39 @@ def test_schema3_fields_have_gates(tmp_path, records, change, kind):
     assert {issue["kind"] for issue in result["issues_first_100"]} == {kind}
 
 
+def with_landmarks(records):
+    upgraded = with_schema3(records)
+    for record in upgraded:
+        for star in record["stars"]:
+            star["landmarks_model"] = {"mouth": [250.0, 248.0, 0.9], "madreporite": [270.0, 230.0, 0.6],
+                                       "butthole": [12.0, 400.0, 0.05]}
+        record["schema_version"] = 4
+    return upgraded
+
+
+@pytest.mark.parametrize("change,kind", [
+    (lambda r: r[0]["stars"][0]["landmarks_model"]["mouth"].__setitem__(2, 0.8), "landmark_probability"),
+    (lambda r: r[0]["stars"][0]["landmarks_model"]["madreporite"].__setitem__(0, 272.0), "landmark_pixels"),
+    (lambda r: r[0]["stars"][0]["landmarks_model"].__setitem__("mouth", None), "landmarks_model"),
+])
+def test_landmarks_have_gates(tmp_path, records, change, kind):
+    reference = with_landmarks(records)
+    assert gate(tmp_path, reference, deepcopy(reference))["pass"] is True
+    candidate = deepcopy(reference)
+    change(candidate)
+    result = gate(tmp_path, reference, candidate)
+    assert result["pass"] is False
+    assert {issue["kind"] for issue in result["issues_first_100"]} == {kind}
+
+
+def test_a_hidden_landmarks_position_is_not_compared(tmp_path, records):
+    reference = with_landmarks(records)
+    candidate = deepcopy(reference)
+    candidate[0]["stars"][0]["landmarks_model"]["butthole"][:2] = [300.0, 10.0]  # p 0.05: a flat map's maximum
+    result = gate(tmp_path, reference, candidate)
+    assert result["pass"] is True and result["maxima"]["landmark_pixels"] == 0.0
+
+
 def test_legacy_and_schema3_outputs_compare_on_shared_fields(tmp_path, records):
     upgraded = with_schema3(records)
     for reference, candidate in ((records, upgraded), (upgraded, records), (records, records)):

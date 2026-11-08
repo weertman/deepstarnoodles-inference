@@ -80,8 +80,8 @@ def test_annotate_video_writes_one_record_per_frame(tmp_path, monkeypatch, ahead
     assert all(len(record["stars"]) == 1 for record in records)
     assert [record["time_s"] for record in records] == [float(i) for i in range(6)]
     assert all(list(record)[-4:] == ["video", "time_s", "fps", "schema_version"] for record in records)
-    assert all(list(record["stars"][0])[-4:] == ["body_origin_model", "body_origin_code",
-                                                 "support_area_model_px", "support_centroid_model"]
+    assert all(list(record["stars"][0])[-5:] == ["body_origin_model", "body_origin_code",
+                                                 "support_area_model_px", "support_centroid_model", "landmarks_model"]
                for record in records)
     assert summary["fps"] == 1.0
 
@@ -142,5 +142,5 @@ def test_video_frames_expose_the_nominal_frame_rate(tmp_path):
     record = video_service.frame_record({"frame": 0, "image_path": "clip#000002", "source_shape": [48, 64],
                                          "stars": []}, "clip", source.fps)
     assert record == {"frame": 2, "image_path": "clip#000002", "source_shape": [48, 64], "stars": [],
-                      "video": "clip", "time_s": 0.4, "fps": 5.0, "schema_version": 3}
+                      "video": "clip", "time_s": 0.4, "fps": 5.0, "schema_version": 4}
     assert video_service.frame_record({"frame": 0, "image_path": "clip#000002", "stars": []}, "clip")["time_s"] is None

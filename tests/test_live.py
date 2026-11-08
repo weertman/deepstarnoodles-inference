@@ -61,7 +61,7 @@ def test_ndarray_cascade_all_zero_remainder_and_source_gaps(monkeypatch):
                                 acquisition_clock="opencv_read_completed")
                for count, index in [(3, 10), (0, 14), (1, 19)]]
     assert [r["frame"] for r in records] == [10, 14, 19]
-    assert all(r["time_s"] is None and r["fps"] is None and r["schema_version"] == 3 for r in records)
+    assert all(r["time_s"] is None and r["fps"] is None and r["schema_version"] == 4 for r in records)
     assert [r["processed_index"] for r in records] == [0, 1, 2]
     assert [r["skipped_source_indices_since_previous"] for r in records] == [0, 3, 4]
     assert [len(r["stars"]) for r in records] == [3, 0, 1]
@@ -87,8 +87,8 @@ def test_predict_times_records_from_the_source_index(monkeypatch):
     assert events == [] and pipeline.processed == 0
     timed = pipeline.predict(pixels(1), source_index=21, fps=2.0)
     assert (timed["time_s"], timed["fps"], list(timed)[-1]) == (10.5, 2.0, "schema_version")
-    assert list(timed["stars"][0])[-4:] == ["body_origin_model", "body_origin_code", "support_area_model_px",
-                                            "support_centroid_model"]
+    assert list(timed["stars"][0])[-5:] == ["body_origin_model", "body_origin_code", "support_area_model_px",
+                                            "support_centroid_model", "landmarks_model"]
 
 
 def test_ndarray_and_file_replay_have_identical_geometry_and_ids(tmp_path, monkeypatch):
@@ -510,6 +510,6 @@ def test_cli_video_streams_ndarrays_and_reports_cleanup(tmp_path, monkeypatch, f
     assert [row["time_s"] for row in rows] == [index / 25.0 for index in range(len(rows))]
     assert all(list(row)[-5:] == ["capture_read_ms", "queue_overwritten_total_at_result", "time_s", "fps",
                                   "schema_version"] and row["fps"] == 25.0 for row in rows)
-    assert report["output_schema_version"] == 3
+    assert report["output_schema_version"] == 4
     assert report["serialize_write"]["samples"] == len(rows)
     assert report["total_job_seconds"] > 0
