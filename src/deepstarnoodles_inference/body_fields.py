@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Weertman
 # SPDX-License-Identifier: MIT
-"""Per-star body origin, support area and support centroid, summarized on the device.
+"""Per-star body origin, support area, support centroid and landmarks, summarized on the device.
 
 The values equal, bit for bit, the host rules they replace:
 
@@ -8,7 +8,11 @@ The values equal, bit for bit, the host rules they replace:
   the first mouth peak (``find_peaks(mouth, 0.15, 8)``), else the mean of ``support > 0.3`` pixels,
   else the crop centre; code 0, 1 or 2 (``noodle_polylines`` ``BODY_ORIGIN_CODES``);
 * support area: the number of ``support > 0.5`` pixels; support centroid: their float64 mean
-  ``[x, y]``, ``None`` when the area is 0 (the paper re-trace's frame landmarks).
+  ``[x, y]``, ``None`` when the area is 0 (the paper re-trace's frame landmarks);
+* landmarks: for the mouth, madreporite and butthole heatmaps, ``[x, y, p]`` at the map's maximum,
+  the first in row-major order when several pixels tie, or ``None`` if the map's maximum isn't finite.
+  Nothing is thresholded, so a landmark the model can't see keeps a low ``p``. These have no host
+  rule to match.
 
 ``find_peaks(...)[0]`` is the global maximum of the mouth map whenever that maximum is at least
 ``f32(0.15)``: it always passes the max-pool test, the output is sorted by score, and NMS never drops
@@ -30,7 +34,8 @@ from scipy.ndimage import maximum_filter
 import torch
 
 from .records import (AREA_SUPPORT_THRESHOLD, BODY_ORIGIN_CENTRE, BODY_ORIGIN_MOUTH, BODY_ORIGIN_SUPPORT,
-                      MOUTH_PEAK_NMS, MOUTH_PEAK_THRESHOLD, ORIGIN_SUPPORT_THRESHOLD)
+                      FIRST_LANDMARK_CHANNEL, LANDMARKS, MOUTH_PEAK_NMS, MOUTH_PEAK_THRESHOLD,
+                      ORIGIN_SUPPORT_THRESHOLD)
 _INDEX_LOCK = threading.Lock()
 _INDEX: dict[tuple[str, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
 _MOUTH_THRESHOLD_F32 = np.float32(MOUTH_PEAK_THRESHOLD)
@@ -80,12 +85,21 @@ def origin_from_maps(support_map: np.ndarray, mouth_map: np.ndarray) -> tuple[np
 
 
 def host_body_fields(support_map: np.ndarray, mouth_map: np.ndarray) -> dict:
-    """The four star fields computed on the host from one crop's maps (reference implementation)."""
+    """The four schema-3 star fields computed on the host from one crop's maps (reference implementation)."""
     origin, code = origin_from_maps(support_map, mouth_map)
     ys, xs = np.nonzero(support_map > AREA_SUPPORT_THRESHOLD)
     centroid = [float(xs.mean()), float(ys.mean())] if len(xs) else None
     return {"body_origin_model": [float(origin[0]), float(origin[1])], "body_origin_code": int(code),
             "support_area_model_px": int(len(xs)), "support_centroid_model": centroid}
+
+
+def host_landmarks(maps: np.ndarray) -> dict:
+    """``landmarks_model`` from ``(3,H,W)`` float32 landmark maps on the host (reference implementation)."""
+    out = {}
+    for name, heat in zip(LANDMARKS, maps):
+        y, x = np.unravel_index(int(np.argmax(heat)), heat.shape)  # numpy's argmax also takes the first maximum
+        out[name] = [float(x), float(y), float(heat[y, x])] if np.isfinite(heat[y, x]) else None
+    return out
 
 
 class PendingBody:
@@ -98,7 +112,13 @@ class PendingBody:
         host = self.packed.cpu().numpy()
         self.packed = None
         out = []
-        for b, (mmax, arg, ties, n5, sx5, sy5, n3, sx3, sy3) in enumerate(host.tolist()):
+        for b, row in enumerate(host.tolist()):
+            mmax, arg, ties, n5, sx5, sy5, n3, sx3, sy3 = row[:9]
+            landmarks = None
+            if len(row) > 9:
+                landmarks = {name: [float(int(index) % self.width), float(int(index) // self.width),
+                                    float(np.float32(value))] if np.isfinite(value) else None
+                             for name, value, index in zip(LANDMARKS, row[9::2], row[10::2])}
             if n5:
                 area, centroid = int(n5), [sx5 / n5, sy5 / n5]
             else:
@@ -116,17 +136,22 @@ class PendingBody:
             else:
                 origin = (np.float32(self.width / 2.0), np.float32(self.height / 2.0))
                 code = BODY_ORIGIN_CENTRE
-            out.append({"body_origin_model": [float(origin[0]), float(origin[1])], "body_origin_code": int(code),
-                        "support_area_model_px": area, "support_centroid_model": centroid})
+            fields = {"body_origin_model": [float(origin[0]), float(origin[1])], "body_origin_code": int(code),
+                      "support_area_model_px": area, "support_centroid_model": centroid}
+            if landmarks is not None:
+                fields["landmarks_model"] = landmarks
+            out.append(fields)
         return out
 
 
 @torch.no_grad()
-def body_summary(support: torch.Tensor, mouth: torch.Tensor, maps_of) -> PendingBody:
+def body_summary(support: torch.Tensor, mouth: torch.Tensor, maps_of,
+                 landmarks: torch.Tensor | None = None) -> PendingBody:
     """Queue the summary of ``(B,H,W)`` float32 support and mouth maps on the current stream (no sync).
 
     ``maps_of(b)`` returns host ``(support, mouth)`` arrays of crop ``b`` equal to these maps; it is
-    called only for crops whose mouth maximum is tied or not finite.
+    called only for crops whose mouth maximum is tied or not finite. ``landmarks`` are the ``(B,3,H,W)``
+    float32 mouth, madreporite and butthole maps; with them, each crop also gets ``landmarks_model``.
     """
     if support.ndim != 3 or support.shape != mouth.shape:
         raise ValueError("support and mouth maps must be matching (B,H,W) tensors")
@@ -143,6 +168,14 @@ def body_summary(support: torch.Tensor, mouth: torch.Tensor, maps_of) -> Pending
         mask = support > threshold
         rows, cols = mask.sum(dim=2), mask.sum(dim=1)
         columns += [rows.sum(dim=1).double(), (cols * ix).sum(dim=1).double(), (rows * iy).sum(dim=1).double()]
+    if landmarks is not None:
+        if landmarks.ndim != 4 or landmarks.shape[1] != len(LANDMARKS) or landmarks.shape[2:] != support.shape[1:]:
+            raise ValueError("landmark maps must be (B,3,H,W) and match the support maps")
+        if landmarks.dtype != torch.float32:
+            raise ValueError("landmarks require float32 activated maps")
+        best, index = landmarks.reshape(len(landmarks), len(LANDMARKS), -1).max(dim=2)
+        for k in range(len(LANDMARKS)):
+            columns += [best[:, k].double(), index[:, k].double()]
     return PendingBody(torch.stack(columns, dim=1), height, width, maps_of)
 
 
@@ -165,6 +198,10 @@ def maps_for_body(raw: torch.Tensor, activated: torch.Tensor | None):
 
 
 def summarize(raw: torch.Tensor, activated: torch.Tensor | None) -> PendingBody:
-    """Queue the body summary of one Hydra output; the transient maps are released on return."""
+    """Queue the body summary of one Hydra output; the transient maps are released on return.
+
+    The landmark maps are always activated from ``raw``: live mode's compact maps lack two of them.
+    """
     support, mouth, maps_of = maps_for_body(raw, activated)
-    return body_summary(support, mouth, maps_of)
+    landmarks = torch.sigmoid(raw[:, FIRST_LANDMARK_CHANNEL:FIRST_LANDMARK_CHANNEL + len(LANDMARKS)].float())
+    return body_summary(support, mouth, maps_of, landmarks)

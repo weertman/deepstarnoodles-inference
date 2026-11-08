@@ -10,7 +10,7 @@ zstd -dc video.jsonl.zst | deepstarnoodles-inference representations - --name vi
 
 ## What the records need
 
-Output from 0.5.0.dev11 onward (record `schema_version` 3) carries every field the presets use:
+Output from 0.5.0.dev11 onward (record `schema_version` 3, or 4 from 0.5.0.dev12, which adds landmarks the presets don't use) carries every field the presets use:
 
 | Record field | Where | Container field |
 |---|---|---|
@@ -33,7 +33,7 @@ Older records (0.5.0.dev10 and earlier) have no body fields or time. They still 
 | `archive`, `serve-videos`, `staged-archive`, one star per frame | `--untracked single` | one, `<input>__starsingle`; arms are re-linked |
 | `archive` etc., several stars per frame | `--untracked detections` | one row per detection; no re-link, no windowed R0 |
 
-Archive records have `star_track_id: null`, and by default the command refuses them, as upstream does. `--untracked single` treats the file as one animal and makes frames without a detection `has_star=False` rows. It fails on the first frame with two detections. `--untracked detections` keeps every detection as an independent row: `frame_index` is renumbered and the video frame is kept in `source_frame_index`. Per-detection outputs (T0 to T2 and Fig 4B) are valid. Re-linking and the windowed R0 policies would mix animals, so they give an error row.
+Archive records have `star_track_id: null`, and by default the command refuses them, as upstream does. For `serve-videos` output with several stars per frame, run `deepstarnoodles-inference track-videos` first. It assigns star and arm IDs as live replay does, and its output reads with the default. `--untracked single` treats the file as one animal and makes frames without a detection `has_star=False` rows. It fails on the first frame with two detections. `--untracked detections` keeps every detection as an independent row: `frame_index` is renumbered and the video frame is kept in `source_frame_index`. Per-detection outputs (T0 to T2 and Fig 4B) are valid. Re-linking and the windowed R0 policies would mix animals, so they give an error row.
 
 For a tracked star, every frame between its first and last appearance where it is missing becomes a `has_star=False` row, as in the paper re-trace, so Fig 4 frame-to-frame deformation resets across the gap instead of bridging it. `--no-fill-gaps` turns this off.
 

@@ -21,7 +21,9 @@ DEFAULT_TOLERANCES = {"bbox_pixels": 1.0, "polyline_crop_pixels": 1.0,
                       # Schema-3 fields, compared only when both records carry them.
                       "body_origin_pixels": 1.0, "support_centroid_pixels": 1.0,
                       "support_area_fraction": 0.01, "require_same_body_origin_code": True,
-                      "time_s": 1e-9}
+                      "time_s": 1e-9,
+                      # Schema-4 landmarks: a position is compared only where both runs see the landmark.
+                      "landmark_probability": 0.01, "landmark_pixels": 1.0, "landmark_visible_p": 0.5}
 
 
 def mask_iou(left, right, source_shape):
@@ -44,7 +46,7 @@ def mask_iou(left, right, source_shape):
 
 
 def compare_body(sa, sb, frame, tolerance, issue, numeric):
-    """Compare the schema-3 star fields present in both records; returns how many were compared."""
+    """Compare the schema-3 and -4 star fields present in both records; returns how many were compared."""
     compared = 0
     if "body_origin_code" in sa and "body_origin_code" in sb:
         compared += 1
@@ -65,6 +67,18 @@ def compare_body(sa, sb, frame, tolerance, issue, numeric):
             issue("support_centroid_model", frame)
         elif left is not None:
             numeric("support_centroid_pixels", float(np.linalg.norm(np.subtract(left, right))), frame)
+    if "landmarks_model" in sa and "landmarks_model" in sb:
+        compared += 1
+        left_points, right_points = sa["landmarks_model"], sb["landmarks_model"]
+        for name in sorted(set(left_points) | set(right_points)):
+            left, right = left_points.get(name), right_points.get(name)
+            if (left is None) != (right is None):
+                issue("landmarks_model", frame)
+            elif left is not None:
+                numeric("landmark_probability", abs(left[2] - right[2]), frame)
+                # Where the model can't see a landmark its map is flat, and the maximum's position is noise.
+                if min(left[2], right[2]) >= tolerance["landmark_visible_p"]:
+                    numeric("landmark_pixels", float(np.hypot(left[0] - right[0], left[1] - right[1])), frame)
     return compared
 
 
@@ -72,7 +86,8 @@ def _compare(reference, candidate, tolerances=None):
     tolerance = {**DEFAULT_TOLERANCES, **(tolerances or {})}
     issues, count, issue_count, new_fields = [], 0, 0, 0
     maxima = {k: 0.0 for k in ("bbox_pixels", "polyline_crop_pixels", "identity_l2", "confidence", "source_mapping_pixels", "length_px",
-                               "body_origin_pixels", "support_centroid_pixels", "support_area_fraction", "time_s")}
+                               "body_origin_pixels", "support_centroid_pixels", "support_area_fraction", "time_s",
+                               "landmark_probability", "landmark_pixels")}
     minimum_mask_iou = 1.0
 
     def issue(kind, frame):

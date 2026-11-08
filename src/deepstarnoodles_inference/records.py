@@ -4,7 +4,8 @@
 
 Schema 3 adds, after every existing key, per star ``body_origin_model``, ``body_origin_code``,
 ``support_area_model_px`` and ``support_centroid_model``, and per frame ``time_s``, ``fps`` and
-``schema_version``. Readers detect the new fields by key presence: a record without them is a legacy
+``schema_version``. Schema 4 adds per star ``landmarks_model``: ``[x, y, p]`` for the mouth, madreporite
+and butthole. Readers detect the new fields by key presence: a record without them is a legacy
 (0.5.0.dev10 or earlier) record and stays valid.
 """
 from __future__ import annotations
@@ -12,8 +13,8 @@ from __future__ import annotations
 import math
 
 # 1 = single-star records, 2 = the multi-star payload (runtime.multi_star_video_payload),
-# 3 = per-record body and time fields. Absent from a frame record = legacy.
-OUTPUT_SCHEMA_VERSION = 3
+# 3 = per-record body and time fields, 4 = per-star landmarks. Absent from a frame record = legacy.
+OUTPUT_SCHEMA_VERSION = 4
 
 # Body origin source codes; equal to noodle_polylines.container.BODY_ORIGIN_CODES.
 BODY_ORIGIN_MOUTH, BODY_ORIGIN_SUPPORT, BODY_ORIGIN_CENTRE = 0, 1, 2
@@ -21,7 +22,12 @@ MOUTH_PEAK_THRESHOLD, MOUTH_PEAK_NMS = 0.15, 8
 ORIGIN_SUPPORT_THRESHOLD = 0.3   # body-origin fallback (runtime.body_center_from_maps)
 AREA_SUPPORT_THRESHOLD = 0.5     # support area and centroid (the paper re-trace's frame landmarks)
 
-STAR_FIELDS = ("body_origin_model", "body_origin_code", "support_area_model_px", "support_centroid_model")
+# Hydra's point heatmaps, in channel order from FIRST_LANDMARK_CHANNEL (model.CHANNEL_NAMES).
+LANDMARKS = ("mouth", "madreporite", "butthole")
+FIRST_LANDMARK_CHANNEL = 5
+
+STAR_FIELDS = ("body_origin_model", "body_origin_code", "support_area_model_px", "support_centroid_model",
+               "landmarks_model")
 FRAME_TAIL = ("time_s", "fps", "schema_version")
 
 

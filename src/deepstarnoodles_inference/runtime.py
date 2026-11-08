@@ -49,6 +49,18 @@ def track_arms(
         raise ValueError("compact tracking maps must be (2,H,W): support, mouth")
     center = (body_center_from_maps(activated[0], activated[1])
               if support_mouth_only else body_center(activated))
+    return track_arms_at(tracker, frame_index, center, arms)
+
+
+def track_arms_at(
+    tracker: FusedTracker,
+    frame_index: int,
+    center: np.ndarray,
+    arms: list[dict],
+) -> list[int]:
+    """Associate one star's arms given its body center, such as a record's ``body_origin_model``."""
+    if not arms:
+        return []
     sampled: list[np.ndarray] = []
     lengths: list[float] = []
     identities: list[np.ndarray] = []
@@ -109,12 +121,13 @@ class StarArmTrackerRegistry:
         self,
         star_track_id: int,
         frame_index: int,
-        activated: np.ndarray,
+        activated: np.ndarray | None,
         arms: list[dict],
         *,
         support_mouth_only: bool = False,
+        center: np.ndarray | None = None,
     ) -> list[int]:
-        """Associate arms using full activations or explicit support/mouth maps."""
+        """Associate arms using full activations, explicit support/mouth maps, or a known body ``center``."""
         star_track_id = int(star_track_id)
         frame_index = int(frame_index)
         previous_frame = self._last_seen.get(star_track_id)
@@ -127,6 +140,8 @@ class StarArmTrackerRegistry:
             tracker = self._tracker_factory()
             self._trackers[star_track_id] = tracker
         self._last_seen[star_track_id] = frame_index
+        if center is not None:
+            return track_arms_at(tracker, frame_index, np.asarray(center, dtype=np.float32), arms)
         return track_arms(tracker, frame_index, activated, arms,
                           support_mouth_only=support_mouth_only)
 
