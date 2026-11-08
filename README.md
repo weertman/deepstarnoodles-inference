@@ -8,9 +8,10 @@ The trained models are YOLO26-L segmentation, **DINOv3 ConvNeXt-Base** and a GRU
 |---|---|
 | This README | Installing, getting the models and the commands to run |
 | [docs/options.md](docs/options.md) | Every speed, scheduling and live option, including the ones measurement rejected |
+| [docs/representations.md](docs/representations.md) | Turning output into the paper's polyline representations |
 | [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) | Every measurement, with rates per GPU type, output agreement and memory |
 
-**Version note.** This branch is 0.5.0.dev10. The published container image is still 0.4.0, so it lacks `serve-videos` and most options in the commands below. Install from source or build the image from this repository, as shown next.
+**Version note.** This branch is 0.5.0.dev11. It writes output schema 3, which adds each star's body origin, support area and centroid and each frame's time, and it adds the `representations` command. The published container image is still 0.4.0, so it lacks `serve-videos` and most options in the commands below. Install from source or build the image from this repository, as shown next.
 
 ## Install
 
@@ -115,11 +116,26 @@ Latency on short warmed replays improved with this profile, but those replays do
 
 Each line of a `.jsonl` file is one frame:
 
-- A frame has `image_path`, `source_shape` and `stars`, plus `video` and `frame` from `serve-videos`.
+- A frame has `frame`, `image_path`, `source_shape` and `stars`, plus `video` from `serve-videos`. `frame` is the video frame for `serve-videos` and `live --video` and the CSV row for image indexes.
 - A star has `detection_index`, `star_track_id`, `crop` (`left`, `top`, `side`, `confidence`, `bbox_xyxy`), `mask_polygon_source` and `arms`.
 - An arm has `polyline_source`, `polyline_crop`, `length_px`, `steps`, `stop_reason`, `state_confidence`, `tip_score`, `base_score` and an `identity` vector. Archive arms use `arm_index`, and live arms use `track_id` scoped to their `star_track_id`.
+- After its arms, a star has `body_origin_model` (`[x, y]`), the runtime body centre that arm association uses, and `body_origin_code`, which says where it came from: 0 for the mouth peak, 1 for the support > 0.3 centroid and 2 for the crop centre. It also has `support_area_model_px`, the number of support > 0.5 pixels, and `support_centroid_model`, their mean `[x, y]`, which is `null` when the area is 0.
+- Each frame ends with `time_s`, `fps` and `schema_version` (3). `time_s` is `frame / fps`. The rate comes from the video for `serve-videos` and `live --video`, and from `--fps` for image indexes. Without a rate, as for a camera, both are `null`. For image indexes `time_s` counts from the first CSV row, not from the start of the video: stills cut from mid-video need their start time added.
 
-Coordinates are in source pixels unless the name says crop.
+Coordinates are in source pixels unless the name says crop or model. Model coordinates are pixels of the 512-pixel crop.
+
+Schema 3 only appends keys: every earlier key keeps its value and position, and each file still has exactly one line per frame. Readers should detect the new fields by their presence, since records from 0.5.0.dev10 and earlier lack them. `compare` checks the new fields only when both files have them.
+
+## Representations
+
+`representations` turns output files into the polyline representations of the DeepStarNoodles paper figures, using `noodle_polylines` vendored from DeepStarNoodles. It needs no GPU, PyTorch or OpenCV:
+
+```bash
+deepstarnoodles-inference representations outputs/live/predictions.jsonl --output reps/ --csv
+deepstarnoodles-inference representations stream_out/ --output reps/ --untracked single --preset fig6_flipping
+```
+
+It writes one container per star, each preset's outputs, optional CSV tables and a manifest. Archive and `serve-videos` records carry no star IDs, so pass `--untracked single` for one animal per video, or `--untracked detections`. Records from 0.5.0.dev10 and earlier give only the outputs that need no body origin. [docs/representations.md](docs/representations.md) covers presets, R0 context and the output layout.
 
 ## Known issues
 

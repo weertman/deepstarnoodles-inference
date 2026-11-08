@@ -20,9 +20,11 @@ import torch
 
 from . import benchmark as b
 from .archive_decode import ArchiveSourceGroups, accumulate_decode_report
+from .body_fields import summarize as summarize_bodies
 from .crop import CropConfig, _crop_result, _result_detections, _sunflower_class_ids
 from .hydra import HydraInferConfig, HydraPredictor, predict_hydra_crops
 from .noodle_tracer import load_noodle_tracer_checkpoint, trace_arms_noodle_batch
+from .records import OUTPUT_SCHEMA_VERSION, finalize_frame
 from .runtime import crop_record, source_arm_records
 
 
@@ -125,7 +127,11 @@ def run_shard(args, model_paths, paths, frame_start, spool, timer, state):
             raw, activated = predict_hydra_crops(
                 hydra, images, batch_size=getattr(args, "hydra_batch_size", None),
                 minimal=getattr(args, "hydra_output_mode", "full") == "minimal")
+            pending = summarize_bodies(raw, activated)
             raw_cpu, images_cpu = raw.cpu().numpy(), images.cpu().numpy()
+            for entry, body in zip(group, pending.finish()):
+                entry["body"] = body
+            del pending
             for entry, fields, image in zip(group, raw_cpu, images_cpu):
                 save_array(spool / f"{entry['stem']}_raw.npy", fields, state, args)
                 save_array(spool / f"{entry['stem']}_image.npy", image, state, args)
@@ -170,7 +176,8 @@ def run_shard(args, model_paths, paths, frame_start, spool, timer, state):
                         if key in arm:
                             record[key] = arm[key]
                 records[entry["source"]]["stars"].append({"detection_index": entry["detection_index"],
-                    "star_track_id": None, "crop": c, "mask_polygon_source": entry["mask_polygon_source"], "arms": arm_records})
+                    "star_track_id": None, "crop": c, "mask_polygon_source": entry["mask_polygon_source"], "arms": arm_records,
+                    **entry["body"]})
                 arm_count += len(arms)
                 for suffix in ("raw", "image"):
                     path = spool / f"{entry['stem']}_{suffix}.npy"
@@ -198,7 +205,8 @@ def main(argv=None):
         total = torch.cuda.get_device_properties(device).total_memory
         torch.cuda.set_per_process_memory_fraction(min(args.allocator_limit_gib * 1024**3 / total, 1.0), device)
     args.output.mkdir(parents=True, exist_ok=False)
-    report = {"schema_version": 1, "status": "running", "schedule": "staged-archive",
+    report = {"schema_version": 1, "output_schema_version": OUTPUT_SCHEMA_VERSION, "status": "running",
+              "schedule": "staged-archive",
               "models": manifest, "models_manifest_sha256": b.sha256(args.models), "index_sha256": b.sha256(args.index),
               "configuration": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
               "inventory": {"torch": torch.__version__, "cuda_runtime": torch.version.cuda, "device": str(device)},
@@ -224,6 +232,7 @@ def main(argv=None):
                 with tempfile.TemporaryDirectory(prefix="spool_", dir=args.output) as directory:
                     records, crop_count, arm_count = run_shard(args, model_paths, shard, sources, Path(directory), timer, state)
                     for record in records:
+                        finalize_frame(record, getattr(args, "fps", None))
                         sink.write(json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n")
                     sink.flush()
                     sources += len(shard)

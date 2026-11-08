@@ -29,12 +29,14 @@ import numpy as np
 import torch
 
 from deepstarnoodles_inference.archive_decode import ArchiveSourceGroups
+from deepstarnoodles_inference.body_fields import summarize as summarize_bodies
 from deepstarnoodles_inference.crop import (
     CropConfig, TrackedStarCropper, _crop_geometry, _crop_result, _result_detections,
     _sunflower_class_ids,
 )
 from deepstarnoodles_inference.hydra import HydraInferConfig, HydraPredictor, predict_hydra_crops, store_autocast_weights
 from deepstarnoodles_inference.noodle_tracer import load_noodle_tracer_checkpoint, trace_arms_noodle_batch
+from deepstarnoodles_inference.records import OUTPUT_SCHEMA_VERSION, finalize_frame, validate_fps
 from deepstarnoodles_inference.runtime import StarArmTrackerRegistry, crop_record, source_arm_records
 
 
@@ -115,7 +117,13 @@ def parse_args(argv=None):
     p.add_argument("--gpu-crops", action="store_true",
                    help="Archive: cut and resize Hydra crops on the GPU with Pillow's fixed-point bilinear "
                         "arithmetic (byte-identical inputs); uploads each source frame that has detections")
+    p.add_argument("--fps", type=float, default=None,
+                   help="Source frame rate: each record gets time_s = frame / fps (null when omitted)")
     args = p.parse_args(argv)
+    try:
+        args.fps = validate_fps(args.fps)
+    except ValueError:
+        p.error("--fps must be finite and positive")
     if not 1 <= args.gru_check_interval <= 128:
         p.error("--gru-check-interval must be between 1 and 128")
     if min(args.images, args.detector_batch_size, args.crop_batch_size) < 1 or args.warmup < 0:
@@ -463,8 +471,9 @@ class Cascade:
         return images
 
     def compute_crops(self, crop_group, images, timer, workspace=None):
-        """Hydra and GRU for one ordered crop group; returns ``(activated, decoded)``.
+        """Hydra and GRU for one ordered crop group; returns ``(activated, decoded, bodies)``.
 
+        ``bodies`` holds each crop's body origin and support fields (see ``body_fields``).
         ``workspace`` supplies per-stream graph state for concurrent crop streams.
         """
         hydra_graph = getattr(self, "hydra_graph", None) if workspace is None else workspace.hydra_graph
@@ -473,6 +482,8 @@ class Cascade:
             raw, activated = predict_hydra_crops(
                 self.hydra, images, batch_size=getattr(self.args, "hydra_batch_size", None),
                 minimal=minimal, tracking=self.live_cropper is not None, graph=hydra_graph)
+            # Queued on this stream, outside any graph or compiled region; read after the GRU.
+            pending = summarize_bodies(raw, activated)
         with timer.stage("gru"):
             execution = getattr(self.args, "gru_execution", "dynamic")
             if execution in ("fixed", "graph"):
@@ -486,10 +497,14 @@ class Cascade:
                     check_interval=getattr(self.args, "gru_check_interval", 8), **graph_options)
             else:
                 decoded = trace_arms_noodle_batch(raw, images, self.tracer, self.trace_params)
-        return activated, decoded
+        # The tracers end with host reads, so this copy waits on no further GPU work.
+        return activated, decoded, pending.finish()
 
-    def record_crops(self, crop_group, activated, decoded, records, start_index, timer):
-        """Track (live) and serialize decoded arms in crop order; returns arm count."""
+    def record_crops(self, crop_group, activated, decoded, records, start_index, timer, bodies=None):
+        """Track (live) and serialize decoded arms in crop order; returns arm count.
+
+        ``bodies`` (one dict per crop) is appended to each star after its arms.
+        """
         total_arms = 0
         minimal = getattr(self.args, "hydra_output_mode", "full") == "minimal"
         with timer.stage("postprocess_track"):
@@ -508,17 +523,20 @@ class Cascade:
                 if not self.live_cropper:
                     for record in arm_records:
                         record["arm_index"] = record.pop("track_id")
-                records[i]["stars"].append({"detection_index": j, "star_track_id": crop.star_track_id,
-                                            "crop": crop_record(crop),
-                                            "mask_polygon_source": crop.mask_polygon.tolist() if crop.mask_polygon is not None else None,
-                                            "arms": arm_records})
+                star = {"detection_index": j, "star_track_id": crop.star_track_id,
+                        "crop": crop_record(crop),
+                        "mask_polygon_source": crop.mask_polygon.tolist() if crop.mask_polygon is not None else None,
+                        "arms": arm_records}
+                if bodies is not None:
+                    star.update(bodies[k])
+                records[i]["stars"].append(star)
                 total_arms += len(arms)
         return total_arms
 
     def infer_crops(self, crop_group, images, records, start_index, timer):
         """One ordered Hydra/GRU group; update indexed source records in place."""
-        activated, decoded = self.compute_crops(crop_group, images, timer)
-        return self.record_crops(crop_group, activated, decoded, records, start_index, timer)
+        activated, decoded, bodies = self.compute_crops(crop_group, images, timer)
+        return self.record_crops(crop_group, activated, decoded, records, start_index, timer, bodies)
 
     def crop_streams(self):
         return getattr(self.args, "crop_streams", 1) or 1
@@ -542,20 +560,23 @@ class Cascade:
         from .noodle_tracer_graph import trace_arms_fixed_slots_concurrent
 
         minimal = getattr(self.args, "hydra_output_mode", "full") == "minimal"
-        hydra_out = []
+        hydra_out, pending = [], []
         with timer.stage("hydra"):
             for _records, _start, _crop_group, images in jobs:
                 hydra_out.append(predict_hydra_crops(
                     self.hydra, images, batch_size=getattr(self.args, "hydra_batch_size", None),
                     minimal=minimal, tracking=self.live_cropper is not None,
                     graph=getattr(self, "hydra_graph", None)))
+                pending.append(summarize_bodies(*hydra_out[-1]))
         with timer.stage("gru"):
             decoded = trace_arms_fixed_slots_concurrent(
                 [(raw, job[3]) for (raw, _activated), job in zip(hydra_out, jobs)],
                 self.tracer, self.trace_params, self.gru_concurrent())
+        bodies = [item.finish() for item in pending]
         total = 0
-        for (records, start, crop_group, _images), (_raw, activated), arms in zip(jobs, hydra_out, decoded):
-            total += self.record_crops(crop_group, activated, arms, records, start, timer)
+        for (records, start, crop_group, _images), (_raw, activated), arms, body in zip(jobs, hydra_out, decoded,
+                                                                                       bodies):
+            total += self.record_crops(crop_group, activated, arms, records, start, timer, body)
         return total
 
     def infer_parallel(self, jobs, records, start_index, timer):
@@ -571,8 +592,8 @@ class Cascade:
         if streams is None:
             streams = self._crop_stream_pool = CropStreams(self, self.crop_streams())
         total_arms = 0
-        for crop_group, activated, decoded in streams.map(jobs):
-            total_arms += self.record_crops(crop_group, activated, decoded, records, start_index, timer)
+        for crop_group, activated, decoded, bodies in streams.map(jobs):
+            total_arms += self.record_crops(crop_group, activated, decoded, records, start_index, timer, bodies)
         return total_arms
 
     def close(self):
@@ -623,6 +644,7 @@ def measure_detect_ahead(pipeline, args, count, sink, shard=False):
                     del jobs
                     for paths_b, records_b, crops_b, _groups_b in batch:
                         for record in records_b:
+                            finalize_frame(record, getattr(args, "fps", None))
                             sink.write(json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n")
                         source_count += len(paths_b)
                         crop_count += crops_b
@@ -646,6 +668,7 @@ def measure_detect_ahead(pipeline, args, count, sink, shard=False):
                         del images
                 del groups
                 for record in records:
+                    finalize_frame(record, getattr(args, "fps", None))
                     sink.write(json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n")
                 sink.flush()
                 # Consumer-stream completion only: the producer stream keeps running.
@@ -697,6 +720,7 @@ def measure(pipeline, args, count, sink, profile, *, shard=False):
                 del frames
             with timer.stage("serialize_write"):
                 for record in records:
+                    finalize_frame(record, getattr(args, "fps", None))
                     sink.write(json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n")
                 sink.flush()
             timer.sync()
@@ -745,7 +769,7 @@ def main(argv=None):
         total = torch.cuda.get_device_properties(device).total_memory
         torch.cuda.set_per_process_memory_fraction(min(args.allocator_limit_gib * 1024**3 / total, 1.0), device)
     args.output.mkdir(parents=True, exist_ok=False)
-    report = {"schema_version": 1, "status": "running", "models": manifest,
+    report = {"schema_version": 1, "output_schema_version": OUTPUT_SCHEMA_VERSION, "status": "running", "models": manifest,
               "models_manifest_sha256": sha256(args.models), "index_sha256": sha256(args.index),
               "configuration": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
               "inventory": {"torch": torch.__version__, "cuda_runtime": torch.version.cuda,

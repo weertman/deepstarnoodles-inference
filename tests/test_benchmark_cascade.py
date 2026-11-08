@@ -13,9 +13,11 @@ import pytest
 import torch
 
 from deepstarnoodles_inference import benchmark
+from deepstarnoodles_inference.body_fields import host_body_fields
 from deepstarnoodles_inference.crop import CropConfig
 from deepstarnoodles_inference.hydra import HydraInferConfig
 from deepstarnoodles_inference.noodle_tracer import NoodleTraceParams
+from deepstarnoodles_inference.records import FRAME_TAIL, OUTPUT_SCHEMA_VERSION, STAR_FIELDS
 
 
 class Boxes:
@@ -97,6 +99,7 @@ def test_archive_detects_crops_all_stars_without_temporal_tracking(tmp_path, mon
     pipeline = make_pipeline(monkeypatch)
     pipeline.args.index = index
     pipeline.args.hydra_output_mode = hydra_output_mode
+    pipeline.args.fps = 4.0
     if hydra_output_mode == "minimal":
         def forbidden(_images):
             raise AssertionError("archive minimal mode must not request full activations")
@@ -142,6 +145,17 @@ def test_archive_detects_crops_all_stars_without_temporal_tracking(tmp_path, mon
     assert arm["arm_index"] == 0 and "track_id" not in arm
     assert arm["stop_reason"] == "base" and arm["steps"] == 3
     assert all(star["star_track_id"] is None for record in records for star in record["stars"])
+    # Schema 3: body fields after the arms of every star, time fields last in every record.
+    maps = np.full((16, 16), 0.5 if hydra_output_mode == "minimal" else 0.0, np.float32)
+    expected = host_body_fields(maps, maps)
+    for record in records:
+        assert list(record)[-3:] == list(FRAME_TAIL)
+        assert (record["time_s"], record["fps"], record["schema_version"]) == (record["frame"] / 4, 4.0,
+                                                                              OUTPUT_SCHEMA_VERSION)
+        for star in record["stars"]:
+            assert list(star)[-5:] == ["arms", *STAR_FIELDS]
+            assert {key: star[key] for key in STAR_FIELDS} == expected
+    assert expected["body_origin_code"] == (0 if hydra_output_mode == "minimal" else 2)
 
 
 @pytest.mark.parametrize("hydra_output_mode", ["full", "minimal"])
@@ -193,10 +207,13 @@ def test_live_replay_tracks_each_frame_before_reading_next_and_resets(tmp_path, 
                       ("read", paths[1].name), ("track", 7, 1), ("prune", 1),
                       ("reset_cropper",), ("clear_registry",)]
     for line in sink.getvalue().splitlines():
-        star = json.loads(line)["stars"][0]
+        record = json.loads(line)
+        star = record["stars"][0]
         assert star["star_track_id"] == 7
         assert star["arms"][0]["track_id"] == 42
         assert "arm_index" not in star["arms"][0]
+        assert list(star)[-4:] == list(STAR_FIELDS)
+        assert record["time_s"] is None and record["fps"] is None
 
 
 @pytest.mark.parametrize("mode", ["archive", "live-replay"])
@@ -301,3 +318,24 @@ def test_main_separates_warmup_resets_state_and_records_outcome(tmp_path, monkey
     manifest.write_text(json.dumps(payload))
     with pytest.raises(ValueError, match="EMA"):
         benchmark.verify_models(manifest)
+
+
+def test_compute_crops_returns_body_fields_without_changing_tracking_input(monkeypatch):
+    pipeline = make_pipeline(monkeypatch, crop_batch=3)
+    pipeline.args.hydra_output_mode = "minimal"
+    pipeline.live_cropper = object()
+    images = torch.zeros(3, 3, 16, 16)
+    activated, decoded, bodies = pipeline.compute_crops([None] * 3, images, benchmark.Timer(torch.device("cpu"), False))
+    assert activated.shape == (3, 2, 16, 16) and len(decoded) == len(bodies) == 3
+    # The fake's compact tracking maps are zeros (not activated), and the body fields read those maps.
+    maps = np.zeros((16, 16), np.float32)
+    assert bodies == [host_body_fields(maps, maps)] * 3
+
+
+def test_fps_option_is_validated():
+    base = ["--models", "m", "--index", "i.csv", "--output", "o", "--mode", "archive"]
+    assert benchmark.parse_args(base).fps is None
+    assert benchmark.parse_args(base + ["--fps", "2"]).fps == 2.0
+    for bad in ("0", "-1", "nan", "inf"):
+        with pytest.raises(SystemExit):
+            benchmark.parse_args(base + ["--fps", bad])

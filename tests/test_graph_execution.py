@@ -343,15 +343,16 @@ def test_crop_streams_yield_in_order_with_exclusive_workspaces():
             time.sleep(random.random() * 0.01)
             with lock:
                 busy.discard(id(workspace))
-            return images * 2, [crop_group]
+            return images * 2, [crop_group], [{"body": crop_group}]
 
     streams = CropStreams(Cascade(), 3)
     jobs = [(lambda value: (lambda workspace: (value, torch.full((1,), float(value), device="cuda"))))(n)
             for n in range(12)]
     results = list(streams.map(jobs))
     streams.close()
-    assert [group for group, _, _ in results] == list(range(12))
-    assert [float(activated) for _, activated, _ in results] == [2.0 * n for n in range(12)]
+    assert [group for group, _, _, _ in results] == list(range(12))
+    assert [float(activated) for _, activated, _, _ in results] == [2.0 * n for n in range(12)]
+    assert [bodies for _, _, _, bodies in results] == [[{"body": n}] for n in range(12)]
 
 
 @pytest.mark.skipif(not CUDA, reason="concurrent GRU rollouts require CUDA")

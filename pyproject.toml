@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deepstarnoodles-inference"
-version = "0.5.0.dev10"
+version = "0.5.0.dev11"
 description = "Portable GPU inference for StarSeg, Hydra dense pose, and GRU arm tracing"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,6 +18,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest==9.0.2"]
+# Reading .jsonl.zst in `representations` before Python 3.14 (or pipe through `zstd -dc`).
+representations = ["zstandard>=0.22"]
 
 [project.scripts]
 deepstarnoodles-inference = "deepstarnoodles_inference.cli:main"

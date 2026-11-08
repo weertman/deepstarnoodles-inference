@@ -19,6 +19,8 @@ import subprocess
 import sys
 import time
 
+from .records import OUTPUT_SCHEMA_VERSION, finalize_frame
+
 SHARD_FLAGS = ("--archive-processes", "--shard-index", "--shard-count", "--shard-sync", "--output")
 
 
@@ -63,6 +65,9 @@ def merge_predictions(output: Path, shards: list[Path], count: int) -> int:
                     raise ValueError(f"shard {frame % len(streams)} ended before frame {frame}")
                 record = json.loads(line)
                 record["frame"] = frame
+                if "schema_version" in record:
+                    # time_s follows the global frame index, not the child's local one.
+                    finalize_frame(record, record.get("fps"))
                 sink.write(json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n")
                 written += 1
         if any(stream.readline() for stream in streams):
@@ -80,7 +85,8 @@ def run_sharded(args, argv: list[str], job_started: float) -> int:
     args.output.mkdir(parents=True, exist_ok=False)
     sync = args.output / "sync"
     sync.mkdir()
-    report = {"schema_version": 1, "status": "running", "schedule": "sharded-archive",
+    report = {"schema_version": 1, "output_schema_version": OUTPUT_SCHEMA_VERSION, "status": "running",
+              "schedule": "sharded-archive",
               "configuration": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
               "models_manifest_sha256": sha256(args.models), "index_sha256": sha256(args.index),
               "limitations": ["Children share one GPU; the per-child allocator guard does not bound the device total.",
