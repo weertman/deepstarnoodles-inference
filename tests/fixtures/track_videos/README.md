@@ -8,7 +8,8 @@ Cut from real 0.5.0.dev12 `serve-videos` annotations (schema 4) of the backcast 
   held 5 s each, 3-4 stars per frame.
 
 To keep them small, `image_path`, `mask_polygon_source` and the arms' `polyline_source` are dropped,
-`polyline_crop` is rounded to 0.01 px and `identity` to 4 decimals. Nothing else is changed.
+`polyline_crop` is rounded to 0.01 px, `identity` is rounded to 4 decimals, and each record's `video` is replaced by
+`flip_r1` or `lab_stress`. Nothing else is changed.
 
 `dev12_botsort.json` holds, per fixture, the SHA-256 of the 0.5.0.dev12 `track-videos` output (BoT-SORT plus
 `runtime.StarArmTrackerRegistry`, ultralytics 8.4.51) and its star and arm IDs per frame:
