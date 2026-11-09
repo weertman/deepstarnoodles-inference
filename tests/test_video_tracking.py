@@ -13,8 +13,9 @@ import subprocess
 import numpy as np
 import pytest
 
-from deepstarnoodles_inference import video_tracking
+from deepstarnoodles_inference import __version__, video_tracking
 from deepstarnoodles_inference.runtime import StarArmTrackerRegistry
+from deepstarnoodles_inference.star_tracking import HungarianParams
 
 ARMS = 5
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "track_videos"
@@ -90,13 +91,27 @@ def test_stars_and_arms_keep_their_identities_through_a_video():
     assert len({tuple(order) for order in orders}) > 1
 
 
-def test_a_star_appearing_later_waits_in_untracked_stars_for_one_frame():
-    tracked = list(video_tracking.track_records(video(8, late=3)))
+def test_with_botsort_a_star_appearing_later_waits_in_untracked_stars_for_one_frame():
+    tracked = list(video_tracking.track_records(video(8, late=3), star_tracker="botsort"))
     assert [len(record["stars"]) for record in tracked] == [2, 2, 2, 2, 3, 3, 3, 3]
     assert [len(record["untracked_stars"]) for record in tracked] == [0, 0, 0, 1, 0, 0, 0, 0]
     newcomer = tracked[3]["untracked_stars"][0]
     assert newcomer["star_track_id"] is None and all(arm["track_id"] is None for arm in newcomer["arms"])
     assert len({item["star_track_id"] for record in tracked for item in record["stars"]}) == 3
+    assert all("star_tracking" not in record for record in tracked)
+
+
+def test_by_default_a_star_is_tracked_in_the_first_frame_it_appears_in():
+    tracked = list(video_tracking.track_records(video(8, late=3)))
+    assert [len(record["stars"]) for record in tracked] == [2, 2, 2, 3, 3, 3, 3, 3]
+    assert all(record["untracked_stars"] == [] for record in tracked)
+    assert {item["star_track_id"] for item in tracked[3]["stars"]} == {1, 2, 3}
+    assert len({item["star_track_id"] for record in tracked for item in record["stars"]}) == 3
+    for record in tracked:
+        assert list(record)[-2:] == ["untracked_stars", "star_tracking"]
+        assert record["star_tracking"]["tracker"] == "hungarian"
+        assert record["star_tracking"]["params"] == HungarianParams().as_dict()
+        assert record["star_tracking"]["version"] == __version__
 
 
 def test_a_saved_center_tracks_arms_exactly_as_the_hydra_maps_would():
@@ -180,7 +195,7 @@ def test_command_refuses_to_overwrite_its_input(tmp_path):
 @pytest.mark.parametrize("name", REAL)
 def test_botsort_output_is_byte_identical_to_dev12(name):
     golden = json.loads((FIXTURES / "dev12_botsort.json").read_text())[name]
-    tracked = list(video_tracking.track_records(real_records(name)))
+    tracked = list(video_tracking.track_records(real_records(name), star_tracker="botsort"))
     ids = [[record["frame"], [[item["star_track_id"], [arm["track_id"] for arm in item["arms"]]]
                               for item in record["stars"]], len(record["untracked_stars"])] for record in tracked]
     assert ids == golden["ids"]
@@ -205,15 +220,16 @@ def degenerate_arms(frame):
     return arms[frame % 3:] if frame % 4 else []
 
 
+@pytest.mark.parametrize("star_tracker", video_tracking.STAR_TRACKERS)
 @pytest.mark.parametrize("name", [*REAL, "degenerate"])
-def test_track_videos_arm_ids_match_the_runtime_registry(name):
+def test_track_videos_arm_ids_match_the_runtime_registry(name, star_tracker):
     """The vendored array tracker gives the arm IDs runtime.StarArmTrackerRegistry (package fused_tracker) gives."""
     if name == "degenerate":
         sequences = [(frame, [(1, degenerate_arms(frame), [256.0, 250.0])]) for frame in range(40)]
     else:
         sequences = [(record["frame"], [(item["star_track_id"], item["arms"], item["body_origin_model"])
                                         for item in record["stars"]])
-                     for record in video_tracking.track_records(real_records(name))]
+                     for record in video_tracking.track_records(real_records(name), star_tracker=star_tracker)]
     runtime, fast = StarArmTrackerRegistry(), video_tracking.ArmTrackers()
     compared = 0
     for frame, stars in sequences:
@@ -234,3 +250,108 @@ def test_arm_trackers_refuse_non_finite_input():
     arms[2]["identity"][0] = float("nan")
     with pytest.raises(ValueError, match="finite"):
         video_tracking.ArmTrackers().track(1, 0, arms, [256.0, 256.0])
+
+
+def test_by_default_the_real_flip_clip_is_one_star_and_only_the_duplicate_box_is_untracked():
+    records = real_records(REAL[0])
+    tracked = list(video_tracking.track_records(records))
+    assert {item["star_track_id"] for record in tracked for item in record["stars"]} == {1}
+    untracked = [(record["frame"], len(record["untracked_stars"])) for record in tracked if record["untracked_stars"]]
+    assert untracked == [(75, 1)]
+    assert sum(len(record["stars"]) + len(record["untracked_stars"]) for record in tracked) == 61
+    frame75 = next(record for record in tracked if record["frame"] == 75)
+    assert frame75["untracked_stars"][0]["crop"]["confidence"] < frame75["stars"][0]["crop"]["confidence"]
+    # botsort splits the same star and holds back two detections
+    botsort = list(video_tracking.track_records(real_records(REAL[0]), star_tracker="botsort"))
+    assert len({item["star_track_id"] for record in botsort for item in record["stars"]}) == 2
+
+
+def test_by_default_every_lab_detection_is_tracked_and_ids_stay_within_a_hold():
+    tracked = list(video_tracking.track_records(real_records(REAL[1])))
+    assert all(record["untracked_stars"] == [] for record in tracked)
+    for record in tracked:
+        ids = [item["star_track_id"] for item in record["stars"]]
+        assert len(set(ids)) == len(ids)
+    # stills are held 5 frames: inside a hold an ID stays on one box (the detector may miss a star for a frame)
+    for start in range(0, 40, 5):
+        boxes = {}
+        for record in tracked[start:start + 5]:
+            for item in record["stars"]:
+                first = boxes.setdefault(item["star_track_id"], item["crop"]["bbox_xyxy"])
+                assert np.abs(np.subtract(item["crop"]["bbox_xyxy"], first)).max() < 3
+
+
+def gap_video(seconds_missing, fps=1.0):
+    """One star moving 0.5 box widths per record, with ``seconds_missing`` seconds of records removed."""
+    records = []
+    resume = 10 + int(seconds_missing * fps)
+    for index, frame in enumerate([*range(10), *range(resume, resume + 10)]):
+        records.append({"frame": frame, "stars": [star((300 + 100 * index, 400.0), 0.05 * index, seed=frame)],
+                        "time_s": frame / fps, "fps": fps})
+    return records
+
+
+def test_ids_continue_across_missing_records_and_end_after_max_gap_s():
+    tracked = list(video_tracking.track_records(gap_video(15)))
+    assert {item["star_track_id"] for record in tracked for item in record["stars"]} == {1}
+    before, after = tracked[9]["stars"][0]["arms"], tracked[10]["stars"][0]["arms"]
+    labels = lambda arms: {arm["true_arm"]: arm["track_id"] for arm in arms}  # noqa: E731
+    assert labels(before) == labels(after)          # the star's arm tracker survives the gap
+    tracked = list(video_tracking.track_records(gap_video(61)))
+    assert [item["star_track_id"] for record in tracked for item in record["stars"]] == [1] * 10 + [2] * 10
+    tracked = list(video_tracking.track_records(gap_video(61), star_params={"max_gap_s": "90"}))
+    assert {item["star_track_id"] for record in tracked for item in record["stars"]} == {1}
+
+
+def test_an_ended_star_drops_its_arm_tracker(monkeypatch):
+    discarded = []
+    original = video_tracking.ArmTrackers.discard
+    monkeypatch.setattr(video_tracking.ArmTrackers, "discard",
+                        lambda self, star_id: (discarded.append(star_id), original(self, star_id)))
+    list(video_tracking.track_records(gap_video(61)))
+    assert discarded == [1]
+
+
+def test_record_time_falls_back_to_fps_then_to_the_frame_number():
+    assert video_tracking._record_time({"time_s": 2.5, "fps": 1.0}, 7) == 2.5
+    assert video_tracking._record_time({"time_s": None, "fps": 2.0}, 7) == 3.5
+    assert video_tracking._record_time({}, 7) == 7.0
+    # records without time_s are gated on frame / fps: 12 frames at 4 fps is 3 s, within max_gap_s=5
+    records = [{"frame": frame, "fps": 4.0, "stars": [star((300.0, 400.0), 0.0, seed=frame)]} for frame in (0, 12)]
+    tracked = list(video_tracking.track_records(records, star_params={"max_gap_s": 5}))
+    assert [record["stars"][0]["star_track_id"] for record in tracked] == [1, 1]
+    records = [{"frame": frame, "fps": 1.0, "stars": [star((300.0, 400.0), 0.0, seed=frame)]} for frame in (0, 12)]
+    tracked = list(video_tracking.track_records(records, star_params={"max_gap_s": 5}))
+    assert [record["stars"][0]["star_track_id"] for record in tracked] == [1, 2]
+
+
+def test_tracker_options_are_checked(tmp_path, capsys):
+    write(tmp_path / "in" / "day1.mp4.jsonl", video(2))
+    out = str(tmp_path / "out")
+    for bad in (["--star-param", "tau_s=1"], ["--star-param", "gate=-1"], ["--star-param", "gate"],
+                ["--star-tracker", "botsort", "--star-param", "gate=3"],
+                ["--tracker-config", str(video_tracking.DEFAULT_BOTSORT_CONFIG)],
+                ["--star-tracker", "botsort", "--tracker-config", str(tmp_path / "missing.yaml")]):
+        with pytest.raises(SystemExit):
+            video_tracking.main([str(tmp_path / "in"), "--output", out, "--jobs", "1", *bad])
+    assert not (tmp_path / "out").exists()       # refused before any job started
+    with pytest.raises(ValueError, match="botsort only"):
+        list(video_tracking.track_records(video(2), tracker_config=video_tracking.DEFAULT_BOTSORT_CONFIG))
+    with pytest.raises(ValueError, match="star_tracker must be"):
+        list(video_tracking.track_records(video(2), star_tracker="bytetrack"))
+
+
+def test_command_records_the_tracker_in_summaries_and_the_run_log(tmp_path, capsys):
+    write(tmp_path / "in" / "day1.mp4.jsonl", video(3))
+    out = tmp_path / "out"
+    assert video_tracking.main([str(tmp_path / "in"), "--output", str(out), "--jobs", "1",
+                                "--star-param", "gate=2.5"]) == 0
+    lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert lines[0]["star_tracker"] == "hungarian" and lines[0]["star_params"]["gate"] == 2.5
+    assert lines[1]["star_ids"] == 2 and lines[1]["star_params"]["gate"] == 2.5
+    assert read(out / "day1.mp4.jsonl")[0]["star_tracking"]["params"]["gate"] == 2.5
+    assert video_tracking.main([str(tmp_path / "in"), "--output", str(tmp_path / "bs"), "--jobs", "1",
+                                "--star-tracker", "botsort", "--overwrite"]) == 0
+    log = [json.loads(line) for line in (tmp_path / "bs" / video_tracking.RUN_LOG).read_text().splitlines()]
+    assert log[0]["star_tracker"] == "botsort" and log[0]["version"] == __version__
+    assert "star_tracking" not in read(tmp_path / "bs" / "day1.mp4.jsonl")[0]
