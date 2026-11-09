@@ -173,13 +173,15 @@ def _track_records_botsort(records: Iterable[dict], tracker_config: Path = DEFAU
     BaseTrack.reset_id()
     for frame, record in _frames_in_order(records):
         stars = record.get("stars") or []
+        # The class column carries each box's record index: BoT-SORT does not use classes, and the rows' last column
+        # (detection index) counts within the high- or low-confidence subset in ultralytics 8.4.51, not the record.
         boxes = _Boxes(np.asarray([star["crop"]["bbox_xyxy"] for star in stars], dtype=np.float32).reshape(-1, 4),
                        np.asarray([star["crop"]["confidence"] for star in stars], dtype=np.float32),
-                       np.zeros(len(stars), dtype=np.float32))
+                       np.arange(len(stars), dtype=np.float32))
         star_ids: list[int | None] = [None] * len(stars)
         for row in tracker.update(boxes):
-            # Rows are x1, y1, x2, y2, track id, score, class, detection index.
-            star_ids[int(row[-1])] = int(row[4])
+            # Rows are x1, y1, x2, y2, track id, score, class (here the record index), detection index.
+            star_ids[int(row[6])] = int(row[4])
         tracked, untracked = _split(registry, frame, stars, star_ids)
         registry.prune(frame)
         record["stars"], record["untracked_stars"] = tracked, untracked

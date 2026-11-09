@@ -355,3 +355,23 @@ def test_command_records_the_tracker_in_summaries_and_the_run_log(tmp_path, caps
     log = [json.loads(line) for line in (tmp_path / "bs" / video_tracking.RUN_LOG).read_text().splitlines()]
     assert log[0]["star_tracker"] == "botsort" and log[0]["version"] == __version__
     assert "star_tracking" not in read(tmp_path / "bs" / "day1.mp4.jsonl")[0]
+
+
+@pytest.mark.parametrize("fuse_score", [True, False])
+def test_botsort_maps_low_confidence_matches_back_to_their_detections(tmp_path, fuse_score):
+    """BoT-SORT's second pass indexes its low-confidence subset; a 0.2 detection must not take another star's ID."""
+    config = tmp_path / "botsort.yaml"
+    text = video_tracking.DEFAULT_BOTSORT_CONFIG.read_text()
+    config.write_text(text.replace("fuse_score: true", f"fuse_score: {str(fuse_score).lower()}"))
+    records = []
+    for frame in range(8):
+        weak = 0.2 if frame >= 5 else 0.9
+        records.append({"frame": frame, "stars": [star((300.0, 400.0), 0.0, seed=frame),
+                                                  star((1400.0, 900.0), 0.4, seed=100 + frame, confidence=weak)]})
+    tracked = list(video_tracking.track_records(records, star_tracker="botsort", tracker_config=config))
+    for record in tracked:
+        ids = {side(item): item["star_track_id"] for item in record["stars"]}
+        assert ids.get("left") == 1 and ids.get("right", 2) == 2
+        assert all(side(item) == "right" for item in record["untracked_stars"])
+    if not fuse_score:   # without score fusion the 0.2 detections match star 2 in the second pass
+        assert all({item["star_track_id"] for item in record["stars"]} == {1, 2} for record in tracked)
