@@ -66,7 +66,7 @@ Workers annotate each frame on its own, so arms are numbered per frame and stars
 
 Move each finished video into `queue/ready/` with a rename. Each worker claims whole videos, decodes every frame and annotates each frame independently. Records are appended to `out/<video>.jsonl.part`, which becomes `out/<video>.jsonl` when the video is done, and the video is then deleted, so the queue works as a rolling cache. A `STOP` file in the queue directory ends every worker after its current frame, and undecodable videos move to `queue/failed/`. `--claim-prefix P` limits workers to names starting with `P`.
 
-On eight GPU types this sustained 19–67 images/s per GPU on a mix of lab videos with about 2.8 stars per frame. The RTX 4090 cost the least per frame, at 41 images/s. [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#round-16-speed-test-across-gpu-types) has the table.
+On nine GPU types this sustained 19–67 images/s per GPU on a mix of lab videos with about 2.8 stars per frame. The RTX 5090 cost the least per frame, at 58 images/s and $1.19/h, and the RTX 4090 was next, at 41 images/s. [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md#round-16-speed-test-across-gpu-types) has the table.
 
 - **Always run several processes under CUDA MPS** (see [Known issues](#known-issues)). Keep `CUDA_MPS_PIPE_DIRECTORY` short, because the control socket path must fit the 108-byte Unix socket limit.
 - **Six to ten processes** saturated every GPU tested. Each holds about 2 GiB of GPU memory, flat from video to video, at every resolution tested up to 5496×3672.
