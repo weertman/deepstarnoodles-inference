@@ -7,9 +7,11 @@
 which measures arms from that star's saved body origin (``body_origin_model``). It needs no GPU, model weights or
 video. Records from before 0.5.0.dev11 have no body origin and can't be tracked.
 
-Star IDs come from the post-hoc Hungarian tracker (default; ``star_tracking``), built for 1-2 fps records: it matches
-on size-normalised centre distance with a gate that grows with the time since a star was seen, bridges gaps and
-missing records up to 60 s, and gives every star an ID in the record it first appears in. ``--star-tracker botsort``
+Star IDs come from the post-hoc Hungarian tracker (default; ``star_tracking``), built for 0.5-2 fps records: it
+matches size-normalised centre distances to each star's predicted position, gives every star an ID in the record it
+first appears in, and starts a new ID rather than guess when two stars could be told apart only by a hair (a
+crossing, a merge, a star coming back next to another one). A star that is not seen keeps its ID for up to 30 s if it
+comes back near where it was and no other star is close. ``--star-tracker botsort``
 restores the 0.5.0.dev12 behaviour byte for byte: BoT-SORT as live replay runs it (without camera-motion
 compensation, which needs the frames), which at 1-2 fps splits a moving star into many IDs and holds each new star's
 first detection back in ``untracked_stars``. Arm IDs come from the released arm tracker either way.
@@ -30,6 +32,7 @@ import numpy as np
 from ._vendor.noodle_polylines import _assoc
 from ._vendor.noodle_polylines.geometry import resample_tip
 from ._vendor.noodle_polylines.tracking import RELEASED, TrackerConfig
+from .input_tree import RUN_LOG, check_record_count, record_files
 from .paths import DEFAULT_BOTSORT_CONFIG
 from .runtime import DEFAULT_STAR_TRACK_MAX_AGE, K_TRACK
 from .star_tracking import HungarianParams, HungarianStarTracker
@@ -121,7 +124,6 @@ def star_tracker(config: Path = DEFAULT_BOTSORT_CONFIG):
 
 
 STAR_TRACKERS = ("hungarian", "botsort")
-RUN_LOG = "_track-videos.jsonl"   # one line per video tracked into an --output directory
 
 
 def _frames_in_order(records: Iterable[dict]) -> Iterator[tuple[int, dict]]:
@@ -345,6 +347,7 @@ def track_file(source: Path, destination: Path, tracker_config: Path | None = No
                     stream.write(line)
         if not counts["frames"]:
             raise ValueError(f"{source} holds no records")
+        check_record_count(source, counts["frames"])     # a cut at a record boundary reads as a shorter video
         os.replace(partial, destination)
     except BaseException:
         partial.unlink(missing_ok=True)       # nothing half-written is left behind
@@ -357,28 +360,38 @@ def _video_name(path: Path) -> str:
     return path.name[:-4] if path.name.endswith(".zst") else path.name
 
 
-def find_inputs(inputs: list[Path], output: Path) -> list[tuple[Path, Path]]:
+def find_inputs(inputs: list[Path], output: Path, notes: list[str] | None = None) -> list[tuple[Path, Path]]:
     """``(source, destination)`` pairs; a directory is searched recursively and mirrored under ``output``.
 
-    Files under ``output`` are never inputs (an output directory inside an input directory is not read back), nor
-    are the fleet's and serve-videos' own files (names starting with ``_``, ``worker.``, ``report.``, ``service.``).
-    Refuses ``x.jsonl`` next to ``x.jsonl.zst`` (one video twice) and two inputs with one destination.
+    Directory symlinks are followed. ``output`` is never searched (an output directory inside an input directory is
+    not read back), nor is another ``track-videos`` output inside an input directory; files whose names start with
+    ``_`` (the fleet's ``_manifest.jsonl``, the run log) and serve-videos' ``worker.``, ``report.`` and ``service.``
+    files are not inputs. What was skipped is added to ``notes``. A file reached twice is tracked once. Refuses
+    ``x.jsonl`` next to ``x.jsonl.zst`` (one video twice) and two inputs with one destination.
     """
     output_resolved = output.resolve()
+    notes = [] if notes is None else notes
     pairs = []
     for item in inputs:
         if item.is_dir():
             if item.resolve() == output_resolved:
                 raise ValueError("--output would overwrite the input records; choose another directory")
-            nested = item.resolve() in output_resolved.parents
-            sources = sorted(path for path in item.rglob("*") if path.is_file() and path.name.endswith(SUFFIXES)
-                             and not path.name.startswith(("_", "worker.", "report.", "service."))
-                             and not (nested and output_resolved in path.resolve().parents))
+            sources, skipped = record_files(
+                item, lambda path: path.name.endswith(SUFFIXES) and path.is_file()
+                and not path.name.startswith(("worker.", "report.", "service."))
+                and output_resolved not in path.resolve().parents, exclude=output)
+            notes.extend(skipped)
             pairs += [(path, output / path.relative_to(item)) for path in sources]
         elif item.is_file() and item.name.endswith(SUFFIXES):
             pairs.append((item, output / item.name))
         else:
             raise FileNotFoundError(f"{item} is neither a directory nor a .jsonl or .jsonl.zst file")
+    unique, seen = [], set()
+    for source, destination in pairs:
+        if source.resolve() not in seen:      # the same file twice, or a directory and a file inside it
+            seen.add(source.resolve())
+            unique.append((source, destination))
+    pairs = unique
     videos: dict[Path, Path] = {}
     destinations: dict[Path, Path] = {}
     for source, destination in pairs:
@@ -420,8 +433,8 @@ def main(argv=None) -> int:
                         help="hungarian (default): the post-hoc star tracker for 1-2 fps records; botsort: BoT-SORT "
                              "as live replay runs it, the 0.5.0.dev12 behaviour")
     parser.add_argument("--star-param", action="append", default=[], metavar="KEY=VALUE",
-                        help="override one Hungarian star-tracker parameter (repeatable): gate, gate_per_s, gate_max, "
-                             "size_weight, size_gate, size_hist, max_gap_s, dup_iou, min_conf_new")
+                        help="override one Hungarian star-tracker parameter (repeatable): "
+                             + ", ".join(HungarianParams.__dataclass_fields__))
     parser.add_argument("--tracker-config", type=Path, default=None,
                         help=f"BoT-SORT configuration for --star-tracker botsort (default {DEFAULT_BOTSORT_CONFIG.name})")
     parser.add_argument("--overwrite", action="store_true", help="redo videos whose tracked records already exist")
@@ -435,10 +448,15 @@ def main(argv=None) -> int:
         parser.error(str(exc))
     if tracker_config is not None and not tracker_config.is_file():
         parser.error(f"--tracker-config {tracker_config} does not exist")
+    notes: list[str] = []
     try:
-        pairs = find_inputs(args.inputs, args.output)
+        pairs = find_inputs(args.inputs, args.output, notes)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
+    for note in notes:
+        print(f"track-videos: {note}", file=sys.stderr, flush=True)
+    if not pairs:
+        parser.error("no input files found (.jsonl or .jsonl.zst records)")
     if any(source.resolve() == destination.resolve() for source, destination in pairs):
         parser.error("--output would overwrite the input records; choose another directory")
     todo = [(source, destination, star_tracker, params, tracker_config) for source, destination in pairs

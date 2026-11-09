@@ -17,10 +17,11 @@ gap rows for tracked stars, the per-arm pass-through fields and archive records 
 from __future__ import annotations
 
 import argparse
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ProcessPoolExecutor
 import contextlib
 import csv
+import fnmatch
 import glob
 import io
 import json
@@ -41,6 +42,7 @@ from ._vendor.noodle_polylines.adapters import (_drop_unused_arrays, _stack_iden
                                                 _zstd_decompress)
 from ._vendor.noodle_polylines.container import ContainerError, PolylineContainer, _offsets
 from ._vendor.noodle_polylines.pipeline import save_outputs
+from .input_tree import expected_records as manifest_records, record_files
 
 VENDORED_COMMIT = "f749a4906de639b9a36c08ff0def015dbe558ff1"
 UNTRACKED_MODES = ("error", "single", "detections")
@@ -179,21 +181,29 @@ def iter_records(source, *, skip_unused: bool = True) -> Iterator[tuple[dict, An
         for number, line in enumerate(stream, 1):
             if not line.strip():
                 continue
+            where = "<stream>" if hasattr(source, "read") else str(source)
             if first is None:
                 first = line
                 try:
                     record = json.loads(prepare(line))
-                except json.JSONDecodeError:
-                    # A pretty-printed JSON document: parse it whole.
-                    yield from _payload_records(json.loads(prepare(line + stream.read())))
+                except json.JSONDecodeError as exc:
+                    # A pretty-printed JSON document parses whole; anything else is a broken first record.
+                    try:
+                        payload = json.loads(prepare(line + stream.read()))
+                    except json.JSONDecodeError:
+                        raise ContainerError(f"{where}: line {number} (before any record) is not a JSON record "
+                                             f"({exc.msg}); the file is truncated or corrupt") from None
+                    yield from _payload_records(payload)
                     return
             else:
                 try:
                     record = json.loads(prepare(line))
                 except json.JSONDecodeError as exc:
-                    where = "<stream>" if hasattr(source, "read") else str(source)
                     raise ContainerError(f"{where}: line {number} (after frame {last_frame}) is not a JSON record "
                                          f"({exc.msg}); the file is truncated or corrupt") from None
+            if not isinstance(record, (dict, list)):
+                raise ContainerError(f"{where}: line {number} is not a frame record (a JSON "
+                                     f"{type(record).__name__})")
             if isinstance(record, dict):
                 last_frame = record.get("frame", last_frame)
             if isinstance(record, dict) and "frames" in record:
@@ -306,7 +316,8 @@ def _star_entries(record, frame, untracked, name):
 
 
 def load_inference(source, *, fps: float | None = None, untracked: str = "error", skip_unused: bool = True,
-                   fill_gaps: bool = True, name: str | None = None) -> dict:
+                   fill_gaps: bool = True, name: str | None = None,
+                   expected_records: tuple[int, Any] | None = None) -> dict:
     """Split inference output into one :class:`PolylineContainer` per star.
 
     Keys: the ``star_track_id`` of tracked multi-star records (``live``, ``live-replay``), ``None`` for
@@ -323,8 +334,10 @@ def load_inference(source, *, fps: float | None = None, untracked: str = "error"
     re-trace's no-star rows do. Rows go by frame number at the file's frame spacing, so frames with no
     record at all are filled too (``meta['missing_records']``, with a warning); without a frame rate their
     times are unknown and they are left out, with a warning. A file without records, a line that is not
-    JSON and a truncated compressed file raise. Pass-through arm fields (``tip_score``, ``base_score``,
-    ``state_confidence``, ``steps``, ``stop_reason``) are kept when every arm has them; inference-only
+    JSON and a truncated compressed file raise, as does a record count other than ``expected_records``
+    (``(count, where)``, from the fleet's ``_manifest.jsonl``: a cut at a record boundary reads as a shorter
+    video). Pass-through arm fields (``tip_score``, ``base_score``, ``state_confidence``, ``steps``,
+    ``stop_reason``) are kept when every arm has them; inference-only
     stop reasons map to -1. Missing fields are listed in ``meta['missing_fields']``; the body origin is
     never approximated.
     """
@@ -339,7 +352,11 @@ def load_inference(source, *, fps: float | None = None, untracked: str = "error"
     schemas: set = set()
     kinds: set[str] = set()
     for position, (record, header_fps) in enumerate(iter_records(source, skip_unused=skip_unused)):
-        frame = int(record["frame"])
+        value = record.get("frame") if isinstance(record, dict) else None
+        if isinstance(value, bool) or not (isinstance(value, int) or isinstance(value, float) and value.is_integer()):
+            raise ContainerError(f"{name}: record {position + 1} is not a frame record (it needs an integer "
+                                 f"'frame'{f', after frame {frames[-1]}' if frames else ''})")
+        frame = int(value)
         if frames and frame <= frames[-1]:
             raise ContainerError(f"{name}: frames are not in strictly increasing order (frame {frame} after "
                                  f"{frames[-1]})")
@@ -361,6 +378,10 @@ def load_inference(source, *, fps: float | None = None, untracked: str = "error"
             stars.setdefault(key, _Star()).add(position, frame, crop, arms, star, detection)
     if not frames:
         raise ContainerError(f"{name}: holds no records")
+    if expected_records is not None and expected_records[0] != len(frames):
+        raise ContainerError(f"{name}: holds {len(frames)} records, but {expected_records[1]} lists "
+                             f"{expected_records[0]} for it; the file is truncated or incomplete (move the manifest "
+                             "aside if the video was annotated again elsewhere)")
     if len(fps_values) > 1:
         raise ContainerError(f"{name}: records disagree on fps: {sorted(fps_values)}")
     record_fps = next(iter(fps_values), None)
@@ -381,10 +402,23 @@ def _check_fps(value, name):
 
 
 def _frame_step(frames: list[int]) -> int:
-    """The video's frame spacing: the greatest common divisor of the frame differences (1 for one record)."""
+    """The video's frame spacing: its most common frame difference (the smallest of equally common ones; 1 for one
+    record). One record off the grid does not turn a file of every second frame into one of every frame."""
     if len(frames) < 2:
         return 1
-    return math.gcd(*(b - a for a, b in zip(frames, frames[1:])))
+    counts = Counter(b - a for a, b in zip(frames, frames[1:]))
+    return min(counts, key=lambda step: (-counts[step], step))
+
+
+def _frame_span(frames: list[int], first: int, last: int) -> list[int]:
+    """Every record's frame from ``first`` to ``last``, plus the frames a gap wider than the frame spacing lacks."""
+    step = _frame_step(frames)
+    inside = [f for f in frames if first <= f <= last]
+    span = []
+    for a, b in zip(inside, inside[1:]):
+        span.append(a)
+        span.extend(range(a + step, b, step))
+    return span + inside[-1:]
 
 
 def _build(key, s: _Star, frames, times, fps, fill_gaps, record_schema, name) -> PolylineContainer:
@@ -402,7 +436,7 @@ def _build(key, s: _Star, frames, times, fps, fill_gaps, record_schema, name) ->
         present = dict(zip(s.frame, range(rows)))
         record_of = {frame: p for p, frame in enumerate(frames)}
         first, last = (frames[0], frames[-1]) if key == "single" else (s.frame[0], s.frame[-1])
-        span = range(first, last + 1, _frame_step(frames))
+        span = _frame_span(frames, first, last)
         absent = [f for f in span if f not in record_of]
         if absent and fps is None:
             meta_warnings.append(f"{len(absent)} frames between {first} and {last} have no record and the frame "
@@ -517,10 +551,11 @@ INPUT_PATTERNS = ("predictions.jsonl", "predictions.jsonl.gz", "predictions.json
 EXCLUDED_NAMES = ("report.json", "service.json")
 
 
-def _is_input(path: Path) -> bool:
-    """A record file found in a directory: not a partial file, a report or the fleet's ``_manifest.jsonl``."""
+def _is_input(path: Path, *, underscore: bool = False) -> bool:
+    """A record file found in a directory: not a partial file, a report or (unless ``underscore``) a ``_`` file such
+    as the fleet's ``_manifest.jsonl``."""
     n = path.name
-    if n.endswith(".part") or n in EXCLUDED_NAMES or n.endswith(".meta.json") or n.startswith("_"):
+    if n.endswith(".part") or n in EXCLUDED_NAMES or n.endswith(".meta.json") or (n.startswith("_") and not underscore):
         return False
     if n.startswith("worker.") and n.endswith(".json"):
         return False
@@ -534,9 +569,17 @@ def _base(name: str) -> str:
     return Path(name).stem if Path(name).suffix.lower() in (".jsonl", ".json") else name
 
 
-def _found_in(directory: Path) -> list[tuple[str, str]]:
-    found = {str(p) for pattern in INPUT_PATTERNS for p in directory.rglob(pattern) if _is_input(p)}
-    return [(path, _relative_name(Path(path), directory)) for path in sorted(found)]
+def _found_in(directory: Path, notes: list[str] | None = None) -> list[tuple[str, str]]:
+    """Record files under ``directory`` (``input_tree``: directory symlinks followed, another track-videos output
+    and ``_`` files skipped, with ``notes``), named by their relative paths."""
+    def accept(path: Path) -> bool:
+        return (any(fnmatch.fnmatch(path.name, pattern) for pattern in INPUT_PATTERNS)
+                and _is_input(path, underscore=True))
+
+    paths, skipped = record_files(directory, accept)
+    if notes is not None:
+        notes.extend(skipped)
+    return [(str(path), _relative_name(path, directory)) for path in paths]
 
 
 def _relative_name(path: Path, root: Path) -> str:
@@ -548,13 +591,13 @@ def _relative_name(path: Path, root: Path) -> str:
     return (rel.parent / base).as_posix()
 
 
-def collect_named_inputs(items: list[str]) -> list[tuple[str, str]]:
+def collect_named_inputs(items: list[str], notes: list[str] | None = None) -> list[tuple[str, str]]:
     """``(path, name)`` of every input; sorted by path, de-duplicated.
 
     Files found in a directory are named by their path relative to it (``camA/C0001.mp4``), so files with the same
     name in different subdirectories (cameras) stay apart; files given directly, or matched by a glob, by their stem.
     ``predictions.jsonl`` takes its directory's name. Refuses one video in two formats (``x.jsonl`` and
-    ``x.jsonl.zst``) and two inputs with the same name.
+    ``x.jsonl.zst``) and two inputs with the same name. What directory searches skipped is added to ``notes``.
     """
     found: dict[str, str] = {}
     stdin = False
@@ -564,7 +607,7 @@ def collect_named_inputs(items: list[str]) -> list[tuple[str, str]]:
             continue
         path = Path(item)
         if path.is_dir():
-            found.update((p, n) for p, n in _found_in(path) if p not in found)
+            found.update((p, n) for p, n in _found_in(path, notes) if p not in found)
         elif path.exists():
             found.setdefault(str(path), _relative_name(path, path.parent))
         else:
@@ -573,13 +616,19 @@ def collect_named_inputs(items: list[str]) -> list[tuple[str, str]]:
                 raise FileNotFoundError(f"no input matches {item}")
             for match in sorted(matches):
                 if match.is_dir():
-                    found.update((p, n) for p, n in _found_in(match) if p not in found)
+                    found.update((p, n) for p, n in _found_in(match, notes) if p not in found)
                 elif _is_input(match):
                     found.setdefault(str(match), _relative_name(match, match.parent))
     if stdin and found:
         raise ValueError("'-' (stdin) cannot be combined with other inputs")
     if stdin:
         return [("-", "-")]
+    real: dict[str, str] = {}
+    for path in sorted(found):
+        if os.path.realpath(path) in real:     # the same file twice (a directory and a file inside it, a symlink)
+            del found[path]
+        else:
+            real[os.path.realpath(path)] = path
     videos: dict[Path, str] = {}
     names: dict[str, str] = {}
     for path in sorted(found):
@@ -742,7 +791,8 @@ def process_input(job: dict) -> dict:
         try:
             containers = load_inference(path, fps=options["fps"], untracked=options["untracked"],
                                         skip_unused=not options["parse_all_values"],
-                                        fill_gaps=options["fill_gaps"], name=path if path != "-" else input_name)
+                                        fill_gaps=options["fill_gaps"], name=path if path != "-" else input_name,
+                                        expected_records=manifest_records(path) if path != "-" else None)
         except Exception as exc:   # one unreadable input is reported, the run continues
             info.update(status="error", error=f"{type(exc).__name__}: {exc}")
             return {"input": info, "rows": rows}
@@ -918,10 +968,13 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser, args = parse_args(argv)
+    notes: list[str] = []
     try:
-        named = collect_named_inputs(args.inputs)
+        named = collect_named_inputs(args.inputs, notes)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
+    for note in notes:
+        print(f"representations: {note}", file=sys.stderr)
     inputs = [path for path, _ in named]
     if not inputs:
         parser.error("no input files found")

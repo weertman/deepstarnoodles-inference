@@ -5,7 +5,8 @@
 ```bash
 deepstarnoodles-inference representations results/ --output reps/ --csv
 deepstarnoodles-inference representations clip.jsonl --output reps/ --preset fig5 --onset-s 331
-set -o pipefail   # so a zstd error (a truncated file) fails the pipeline
+set -o pipefail   # so a zstd error (a truncated file) fails the pipeline; a pipe is never checked against the
+                  # fleet's _manifest.jsonl, so read the file itself when you can
 zstd -dc video.jsonl.zst | deepstarnoodles-inference representations - --name video --output reps/ --untracked single
 ```
 
@@ -36,7 +37,7 @@ Older records (0.5.0.dev10 and earlier) have no body fields or time. They still 
 
 Archive records have `star_track_id: null`, and by default the command refuses them, as upstream does. For `serve-videos` output, run `deepstarnoodles-inference track-videos` first ([docs/track-videos.md](track-videos.md)). It assigns star and arm IDs, and its output reads with the default. `--untracked single` treats the file as one animal and makes frames without a detection `has_star=False` rows. It fails on the first frame with two detections, and its error points at `track-videos`; one stray duplicate box is enough, so `track-videos` is the usual route. `--untracked detections` keeps every detection as an independent row: `frame_index` is renumbered and the video frame is kept in `source_frame_index`. Per-detection outputs (T0 to T2 and Fig 4B) are valid. Re-linking and the windowed R0 policies would mix animals, so they give an error row.
 
-For a tracked star, every frame between its first and last appearance where it is missing becomes a `has_star=False` row, as in the paper re-trace, so Fig 4 frame-to-frame deformation resets across the gap instead of bridging it. Rows go by frame number at the file's frame spacing (the greatest common divisor of its frame steps), so frames with no record at all are filled the same way as records without the star. The container's `meta["missing_records"]` counts them, and they raise a warning. Without a frame rate the times of such frames are unknown: they are left out, with a warning. `--untracked single` fills by frame number too. `--no-fill-gaps` turns filling off for tracked stars.
+For a tracked star, every frame between its first and last appearance where it is missing becomes a `has_star=False` row, as in the paper re-trace, so Fig 4 frame-to-frame deformation resets across the gap instead of bridging it. Rows go by frame number at the file's frame spacing (its most common frame step), so frames with no record at all are filled the same way as records without the star. A gap is filled only where it is wider than that spacing, so one record off the grid in a file of every second frame does not fill every frame in between. The container's `meta["missing_records"]` counts them, and they raise a warning. Without a frame rate the times of such frames are unknown: they are left out, with a warning. `--untracked single` fills by frame number too. `--no-fill-gaps` turns filling off for tracked stars.
 
 ## Frame rate
 
@@ -56,7 +57,7 @@ For a tracked star, every frame between its first and last appearance where it i
 
 ## Inputs and outputs
 
-Inputs can be files (`.json`, `.jsonl`, plain or `.gz`, `.bz2`, `.xz` or `.zst`), directories, globs or `-` for stdin. Reading `.zst` needs Python 3.14 or `pip install deepstarnoodles-inference[representations]` (zstandard); otherwise pipe through `zstd -dc` under `set -o pipefail`. Directories are searched recursively for `*.jsonl*`. The search skips `.part` files, `report.json`, `worker.*.json`, `service.json` and every name starting with `_`, such as the fleet runner's `_manifest.jsonl`.
+Inputs can be files (`.json`, `.jsonl`, plain or `.gz`, `.bz2`, `.xz` or `.zst`), directories, globs or `-` for stdin. Reading `.zst` needs Python 3.14 or `pip install deepstarnoodles-inference[representations]` (zstandard); otherwise pipe through `zstd -dc` under `set -o pipefail`. Directories are searched recursively for `*.jsonl*`, following directory symlinks (each real directory once). The search skips `.part` files, `report.json`, `worker.*.json`, `service.json` and every name starting with `_`, such as the fleet runner's `_manifest.jsonl` and `track-videos`' `_track-videos.log`; any other record file starting with `_` is reported on stderr (pass it by name to read it). A subdirectory holding `_track-videos.log` is a `track-videos` output inside the tree: it is skipped with a note, so a raw tree with its tracked copy inside is not read twice. Pass that directory on its own to read it. `track-videos` searches the same way.
 
 **Names.**
 
@@ -87,8 +88,9 @@ Preset rows of a sequence with warnings have the status `warning`. The run's sta
 **Refused or reported as errors.**
 
 - A file without records.
-- A line that is not JSON, such as a truncated last line. The error names the line and the last good frame.
+- A line that is not JSON, such as a truncated last line, or a line that is not a frame record. The error names the line and the last good frame, the first line included.
 - A `.zst` file that ends inside a frame.
+- A file with fewer (or more) records than the fleet's `_manifest.jsonl` lists for it. The nearest `_manifest.jsonl` above the file is used, with its last row for that video. This catches a cut exactly at a record boundary, which the records themselves cannot show. Records read from stdin are not checked.
 - Frames out of order.
 - Records that disagree on fps.
 - Tracked and untracked stars in one file.

@@ -282,11 +282,11 @@ def test_by_default_every_lab_detection_is_tracked_and_ids_stay_within_a_hold():
 
 
 def gap_video(seconds_missing, fps=1.0):
-    """One star moving 0.5 box widths per record, with ``seconds_missing`` seconds of records removed."""
+    """One star crawling 0.03 box widths per record, with ``seconds_missing`` seconds of records removed."""
     records = []
     resume = 10 + int(seconds_missing * fps)
     for index, frame in enumerate([*range(10), *range(resume, resume + 10)]):
-        records.append({"frame": frame, "stars": [star((300 + 100 * index, 400.0), 0.05 * index, seed=frame)],
+        records.append({"frame": frame, "stars": [star((300 + 10 * index, 400.0), 0.05 * index, seed=frame)],
                         "time_s": frame / fps, "fps": fps})
     return records
 
@@ -297,9 +297,9 @@ def test_ids_continue_across_missing_records_and_end_after_max_gap_s():
     before, after = tracked[9]["stars"][0]["arms"], tracked[10]["stars"][0]["arms"]
     labels = lambda arms: {arm["true_arm"]: arm["track_id"] for arm in arms}  # noqa: E731
     assert labels(before) == labels(after)          # the star's arm tracker survives the gap
-    tracked = list(video_tracking.track_records(gap_video(61)))
+    tracked = list(video_tracking.track_records(gap_video(31)))
     assert [item["star_track_id"] for record in tracked for item in record["stars"]] == [1] * 10 + [2] * 10
-    tracked = list(video_tracking.track_records(gap_video(61), star_params={"max_gap_s": "90"}))
+    tracked = list(video_tracking.track_records(gap_video(31), star_params={"max_gap_s": "90"}))
     assert {item["star_track_id"] for record in tracked for item in record["stars"]} == {1}
 
 
@@ -308,7 +308,7 @@ def test_an_ended_star_drops_its_arm_tracker(monkeypatch):
     original = video_tracking.ArmTrackers.discard
     monkeypatch.setattr(video_tracking.ArmTrackers, "discard",
                         lambda self, star_id: (discarded.append(star_id), original(self, star_id)))
-    list(video_tracking.track_records(gap_video(61)))
+    list(video_tracking.track_records(gap_video(31)))
     assert discarded == [1]
 
 
@@ -328,8 +328,8 @@ def test_record_time_falls_back_to_fps_then_to_the_frame_number():
 def test_tracker_options_are_checked(tmp_path, capsys):
     write(tmp_path / "in" / "day1.mp4.jsonl", video(2))
     out = str(tmp_path / "out")
-    for bad in (["--star-param", "tau_s=1"], ["--star-param", "gate=-1"], ["--star-param", "gate"],
-                ["--star-tracker", "botsort", "--star-param", "gate=3"],
+    for bad in (["--star-param", "tau_s=1"], ["--star-param", "jump_gate=-1"], ["--star-param", "jump_gate"],
+                ["--star-tracker", "botsort", "--star-param", "jump_gate=3"],
                 ["--tracker-config", str(video_tracking.DEFAULT_BOTSORT_CONFIG)],
                 ["--star-tracker", "botsort", "--tracker-config", str(tmp_path / "missing.yaml")]):
         with pytest.raises(SystemExit):
@@ -345,11 +345,11 @@ def test_command_records_the_tracker_in_summaries_and_the_run_log(tmp_path, caps
     write(tmp_path / "in" / "day1.mp4.jsonl", video(3))
     out = tmp_path / "out"
     assert video_tracking.main([str(tmp_path / "in"), "--output", str(out), "--jobs", "1",
-                                "--star-param", "gate=2.5"]) == 0
+                                "--star-param", "jump_gate=2"]) == 0
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
-    assert lines[0]["star_tracker"] == "hungarian" and lines[0]["star_params"]["gate"] == 2.5
-    assert lines[1]["star_ids"] == 2 and lines[1]["star_params"]["gate"] == 2.5
-    assert read(out / "day1.mp4.jsonl")[0]["star_tracking"]["params"]["gate"] == 2.5
+    assert lines[0]["star_tracker"] == "hungarian" and lines[0]["star_params"]["jump_gate"] == 2.0
+    assert lines[1]["star_ids"] == 2 and lines[1]["star_params"]["jump_gate"] == 2.0
+    assert read(out / "day1.mp4.jsonl")[0]["star_tracking"]["params"]["jump_gate"] == 2.0
     assert video_tracking.main([str(tmp_path / "in"), "--output", str(tmp_path / "bs"), "--jobs", "1",
                                 "--star-tracker", "botsort", "--overwrite"]) == 0
     log = [json.loads(line) for line in (tmp_path / "bs" / video_tracking.RUN_LOG).read_text().splitlines()]
@@ -407,7 +407,7 @@ def test_an_output_directory_inside_the_input_is_not_read_back(tmp_path, capsys)
     for _ in range(2):
         code, lines, _ = run_command(capsys, raw, "--output", raw / "tracked", "--overwrite")
         assert code == 0 and lines[0]["videos"] == 1
-    assert sorted(p.relative_to(raw).as_posix() for p in raw.rglob("*.jsonl")) == [
+    assert sorted(p.relative_to(raw).as_posix() for p in raw.rglob("*") if p.is_file()) == [
         "cam1/day1.mp4.jsonl", f"tracked/{video_tracking.RUN_LOG}", "tracked/cam1/day1.mp4.jsonl"]
     with pytest.raises(SystemExit):
         video_tracking.main([str(raw), "--output", str(raw)])
@@ -484,3 +484,69 @@ def test_a_symlinked_zst_file_is_read(tmp_path):
     (tmp_path / "in" / "day1.mp4.jsonl.zst").symlink_to(tmp_path / "store" / "day1.mp4.jsonl.zst")
     assert video_tracking.main([str(tmp_path / "in"), "--output", str(tmp_path / "out"), "--jobs", "1"]) == 0
     assert len(read(tmp_path / "out" / "day1.mp4.jsonl.zst")) == 3
+
+
+# ------------------------------------------------------------------ input discovery (verification of 0.5.0.dev13)
+def test_a_symlinked_camera_directory_is_followed(tmp_path, capsys):
+    write(tmp_path / "in" / "camA" / "day1.mp4.jsonl", video(3))
+    write(tmp_path / "elsewhere" / "camB" / "day1.mp4.jsonl", video(4))
+    (tmp_path / "in" / "camB").symlink_to(tmp_path / "elsewhere" / "camB", target_is_directory=True)
+    (tmp_path / "in" / "loop").symlink_to(tmp_path / "in", target_is_directory=True)   # a cycle is entered once
+    code, lines, _ = run_command(capsys, tmp_path / "in", "--output", tmp_path / "out")
+    assert code == 0 and lines[0]["videos"] == 2
+    assert len(read(tmp_path / "out" / "camB" / "day1.mp4.jsonl")) == 4
+
+
+def test_another_track_videos_output_inside_the_input_is_skipped(tmp_path, capsys):
+    raw = tmp_path / "annotations"
+    write(raw / "cam1" / "day1.mp4.jsonl", video(4))
+    assert run_command(capsys, raw, "--output", raw / "tracked_old")[0] == 0
+    code, lines, err = run_command(capsys, raw, "--output", tmp_path / "tracked_new")
+    assert code == 0 and lines[0]["videos"] == 1
+    assert f"skipped {raw / 'tracked_old'}: it holds track-videos output" in err
+
+
+def test_no_input_files_is_an_error(tmp_path, capsys):
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "only").mkdir()
+    (tmp_path / "only" / "_manifest.jsonl").write_text("")
+    for directory in ("empty", "only"):
+        with pytest.raises(SystemExit) as stop:
+            video_tracking.main([str(tmp_path / directory), "--output", str(tmp_path / "out")])
+        assert stop.value.code == 2 and "no input files found" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_a_record_file_starting_with_an_underscore_is_skipped_with_a_note(tmp_path, capsys):
+    write(tmp_path / "in" / "_C0002.mp4.jsonl", video(2))
+    write(tmp_path / "in" / "C0003.mp4.jsonl", video(2))
+    (tmp_path / "in" / "_manifest.jsonl").write_text("")
+    code, lines, err = run_command(capsys, tmp_path / "in", "--output", tmp_path / "out")
+    assert code == 0 and lines[0]["videos"] == 1
+    assert "skipped 1 record file(s) whose names start with '_'" in err and "_C0002.mp4.jsonl" in err
+    assert "_manifest" not in err
+    code, lines, _ = run_command(capsys, tmp_path / "in" / "_C0002.mp4.jsonl", "--output", tmp_path / "by_name")
+    assert code == 0 and lines[1]["frames"] == 2
+
+
+def test_a_file_given_twice_is_tracked_once(tmp_path, capsys):
+    write(tmp_path / "in" / "day1.mp4.jsonl", video(3))
+    for argv in ([tmp_path / "in" / "day1.mp4.jsonl"] * 2, [tmp_path / "in", tmp_path / "in" / "day1.mp4.jsonl"]):
+        code = video_tracking.main([*map(str, argv), "--output", str(tmp_path / "out"), "--jobs", "2", "--overwrite"])
+        lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+        assert code == 0 and lines[0]["videos"] == 1 and len(lines) == 2
+
+
+@pytest.mark.parametrize("suffix", [".jsonl", pytest.param(".jsonl.zst", marks=needs_zstd)])
+def test_a_file_shorter_than_the_fleet_manifest_says_is_an_error(tmp_path, capsys, suffix):
+    # A cut exactly at a record boundary reads as a complete, shorter video; the fleet's manifest knows better.
+    write(tmp_path / "ann" / "cam" / f"short.mp4{suffix}", video(6)[:4])
+    write(tmp_path / "ann" / "cam" / f"whole.mp4{suffix}", video(6))
+    (tmp_path / "ann" / "_manifest.jsonl").write_text(
+        '{"relative": "cam/short.mp4", "frames": 6}\n{"relative": "cam/whole.mp4", "frames": 5}\n'
+        '{"relative": "cam/whole.mp4", "frames": 6}\n{"relative": "cam/half')  # the last row wins; a cut row is skipped
+    code, lines, err = run_command(capsys, tmp_path / "ann", "--output", tmp_path / "out")
+    assert code == 1 and "holds 4 records, but" in err and "lists 6 for it" in err
+    assert [line["frames"] for line in lines[1:]] == [6]
+    assert not (tmp_path / "out" / "cam" / f"short.mp4{suffix}").exists()
+    assert list((tmp_path / "out").rglob("*.part")) == []

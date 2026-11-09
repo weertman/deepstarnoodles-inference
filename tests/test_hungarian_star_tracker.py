@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 import itertools
 
 import pytest
@@ -23,22 +24,51 @@ def run(frames, params=None):
     return [tracker.update(stars, time_s) for time_s, stars in frames], tracker
 
 
-def test_a_three_width_jump_two_seconds_later_keeps_its_id():
-    ids, _ = run([(0.0, [box(1000, 1000)]), (2.0, [box(1000 + 3 * WIDTH, 1000)])])
+def animals_per_id(frames, names, params=None):
+    """``{ID: Counter(animal)}`` for frames whose stars are labelled by ``names`` (one list per frame)."""
+    ids, _ = run(frames, params)
+    carried = defaultdict(Counter)
+    for frame_ids, frame_names in zip(ids, names):
+        for star_id, name in zip(frame_ids, frame_names):
+            carried[star_id][name] += 1
+    return carried
+
+
+def test_a_lone_jump_within_jump_gate_keeps_its_id():
+    # A star moved by hand: 2 widths in 1 s, nothing else nearby.
+    ids, _ = run([(0.0, [box(1000, 1000)]), (1.0, [box(1000 + 2 * WIDTH, 1000)])])
     assert ids == [[1], [1]]
-
-
-def test_a_jump_beyond_gate_max_starts_a_new_id():
-    # dt 10 s would allow 2 + 10 widths, but the gate is capped at 4.
-    ids, _ = run([(0.0, [box(1000, 1000)]), (10.0, [box(1000 + 4.5 * WIDTH, 1000)])])
-    assert ids == [[1], [2]]
-
-
-def test_the_gate_grows_with_the_time_since_a_track_was_seen():
-    ids, _ = run([(0.0, [box(1000, 1000)]), (0.5, [box(1000 + 2.7 * WIDTH, 1000)])])
-    assert ids == [[1], [2]]          # 2.7 widths in 0.5 s: over 2 + 0.5
     ids, _ = run([(0.0, [box(1000, 1000)]), (1.0, [box(1000 + 2.7 * WIDTH, 1000)])])
-    assert ids == [[1], [1]]          # 2.7 widths in 1 s: within 2 + 1
+    assert ids == [[1], [2]]          # beyond jump_gate (2.5)
+
+
+def test_a_jump_next_to_another_star_starts_a_new_id():
+    # The same 2-width jump, but it lands 1 width from a second star: it may as well be another animal.
+    other = box(1000 + 2 * WIDTH, 1000 + WIDTH)
+    ids, _ = run([(0.0, [box(1000, 1000), other]),
+                  (1.0, [box(1000 + 2 * WIDTH, 1000), box(1000 + 2 * WIDTH, 1000 + WIDTH)])])
+    assert ids == [[1, 2], [3, 2]]
+
+
+def test_a_lost_star_comes_back_only_near_where_it_was():
+    for seconds in (10.0, 25.0):
+        ids, _ = run([(0.0, [box(1000, 1000)]), (seconds, [box(1000 + 0.5 * WIDTH, 1000)])])
+        assert ids == [[1], [1]]
+    ids, _ = run([(0.0, [box(1000, 1000)]), (10.0, [box(1000 + 1.2 * WIDTH, 1000)])])
+    assert ids == [[1], [2]]          # 0.75 + 0.02 * 10 = 0.95 widths
+    ids, _ = run([(0.0, [box(1000, 1000)]), (30.0, [box(1000 + 1.2 * WIDTH, 1000)])])
+    assert ids == [[1], [1]]          # 0.75 + 0.02 * 30 = 1.35 widths
+    ids, _ = run([(0.0, [box(1000, 1000)]), (30.0, [box(1000 + 1.6 * WIDTH, 1000)])])
+    assert ids == [[1], [2]]          # capped at 1.5 widths
+
+
+def test_a_lost_star_is_not_taken_back_next_to_another_track():
+    # The newcomer is where the lost star was, but a tracked star is 1 width away: no re-acquisition.
+    still = box(1000, 1000 + WIDTH)
+    frames = [(0.0, [box(1000, 1000), still])] + [(float(t), [still]) for t in range(1, 10)]
+    frames.append((10.0, [box(1000, 1000), still]))
+    ids, _ = run(frames)
+    assert ids[-1] == [3, 2]
 
 
 def test_a_track_unseen_longer_than_max_gap_s_ends():
@@ -46,10 +76,9 @@ def test_a_track_unseen_longer_than_max_gap_s_ends():
     assert ids == [[1], [1]] and tracker.ended == []
     tracker.update([], 60.0)
     assert tracker.ended == [] and tracker.live_ids == [1]   # exactly max_gap_s: still open
-    assert tracker.update([box(1000, 1000)], 90.5) == [2]
+    assert tracker.update([box(1000, 1000)], 60.5) == [2]
     assert tracker.ended == [1] and tracker.live_ids == [2]
-    params = HungarianParams(max_gap_s=120.0)
-    ids, _ = run([(0.0, [box(1000, 1000)]), (100.0, [box(1000, 1000)])], params)
+    ids, _ = run([(0.0, [box(1000, 1000)]), (100.0, [box(1000, 1000)])], HungarianParams(max_gap_s=120.0))
     assert ids == [[1], [1]]
 
 
@@ -80,6 +109,61 @@ def test_two_stars_passing_each_other_keep_their_ids():
         frames.append((float(step), [box(1000 + offset, 1000), box(1000 + 5.7 * WIDTH - offset, 1000 + WIDTH)]))
     ids, _ = run(frames)
     assert all(frame == [1, 2] for frame in ids)
+
+
+@pytest.mark.parametrize("lateral", [0.0, 0.3, 0.6])
+def test_two_stars_crossing_head_on_never_swap(lateral):
+    # 0.2 widths/s each, at 1 fps, both detected throughout (cross_v0.2_y0.0_both): the motion model follows each
+    # star through the crossing; where the boxes coincide the tracker may split an ID, but no ID changes animal.
+    frames, names = [], []
+    for step in range(60):
+        offset = 0.2 * WIDTH * step
+        frames.append((float(step), [box(1000 + offset, 1000),
+                                     box(1000 + 12 * WIDTH - offset, 1000 + lateral * WIDTH)]))
+        names.append(["A", "B"])
+    carried = animals_per_id(frames, names)
+    assert all(len(animals) == 1 for animals in carried.values())
+    if lateral >= 0.3:
+        assert len(carried) == 2
+
+
+def test_a_tracked_star_keeps_its_id_when_a_lost_one_returns_where_it_was():
+    # leave20_bswap: A leaves for 20 s; B walks into A's spot; A comes back where B used to be. B was seen a
+    # second ago, A twenty seconds ago, so B keeps its ID and A gets a new one.
+    frames, names = [], []
+    for t in range(100):
+        b_x = 1000 + 1.5 * WIDTH if t < 60 else max(1000.0, 1000 + 1.5 * WIDTH - 1.5 * WIDTH * (t - 60) / 20)
+        stars, labels = [box(b_x, 1000)], ["B"]
+        if t < 60:
+            stars.append(box(1000, 1000)); labels.append("A")
+        elif t >= 80:
+            stars.append(box(1000 + 1.5 * WIDTH, 1000)); labels.append("A")
+        frames.append((float(t), stars)); names.append(labels)
+    carried = animals_per_id(frames, names)
+    assert all(len(animals) == 1 for animals in carried.values())
+    assert carried[1] == Counter({"B": 100})
+
+
+@pytest.mark.parametrize("gap, offset", [(5.0, 1.0), (20.0, 1.3), (45.0, 0.0)])
+def test_a_newcomer_near_where_a_star_left_gets_a_new_id(gap, offset):
+    # subst: A leaves at t = 60; a different star appears ``gap`` s later ``offset`` widths away, beyond the
+    # re-acquisition reach (0.75 + 0.02 widths per second unseen) or after max_gap_s. (Closer than that, or at the
+    # same spot within 30 s, it takes A's ID: from boxes alone it could be A.)
+    frames = [(float(t), [box(1000, 1000)]) for t in range(60)]
+    frames += [(60 + gap + t, [box(1000 + offset * WIDTH, 1000)]) for t in range(20)]
+    ids, _ = run(frames)
+    assert {i for frame in ids[60:] for i in frame} == {2}
+
+
+def test_one_detection_between_two_tracks_is_ambiguous():
+    # Two stars 0.3 widths apart; next second only one box, halfway: either could be it, so neither ID goes on.
+    ids, tracker = run([(0.0, [box(1000, 1000), box(1000 + 0.3 * WIDTH, 1000)]),
+                        (1.0, [box(1000 + 0.15 * WIDTH, 1000)])])
+    assert ids == [[1, 2], [3]]
+    assert sorted(tracker.ended) == [1, 2] and tracker.live_ids == [3]
+    ids, _ = run([(0.0, [box(1000, 1000), box(1000 + 0.3 * WIDTH, 1000)]),
+                  (1.0, [box(1000 + 0.15 * WIDTH, 1000)])], HungarianParams(ambiguity=0.0))   # 0 turns it off
+    assert ids[1] in ([1], [2])
 
 
 def test_ids_are_numbered_from_one_in_order_of_birth():
@@ -120,15 +204,19 @@ def test_times_must_not_decrease():
 
 
 def test_parameters_are_checked():
-    assert HungarianParams.from_mapping({"gate": "2.5", "size_hist": "5"}) == HungarianParams(gate=2.5, size_hist=5)
+    assert (HungarianParams.from_mapping({"jump_gate": "2", "size_hist": "5"})
+            == HungarianParams(jump_gate=2.0, size_hist=5))
     assert HungarianParams.from_mapping(None) == HungarianParams()
-    with pytest.raises(ValueError, match="unknown star-tracker parameters: tau_s"):
-        HungarianParams.from_mapping({"tau_s": 1})
-    for bad in ({"gate": "5"}, {"gate": 0}, {"size_gate": 1.0}, {"max_gap_s": 0}, {"dup_iou": 1.5},
-                {"size_hist": "2.5"}, {"size_hist": 0}, {"gate": "nan"}, {"gate_per_s": -1}, {"gate": "wide"},
-                {"min_conf_new": 2}):
+    with pytest.raises(ValueError, match="unknown star-tracker parameters: gate"):
+        HungarianParams.from_mapping({"gate": 1})
+    for bad in ({"reacquire_gate": "2"}, {"reacquire_gate": 0}, {"size_gate": 1.0}, {"max_gap_s": 0},
+                {"dup_iou": 1.5}, {"size_hist": "2.5"}, {"size_hist": 0}, {"sigma": "nan"}, {"sigma": 0},
+                {"new_cost": -1}, {"ambiguity": -0.1}, {"velocity_alpha": 1.5}, {"jump_gate": "wide"},
+                {"min_conf_new": 2}, {"recent_s": 0}):
         with pytest.raises(ValueError):
             HungarianParams.from_mapping(bad)
-    assert HungarianParams().as_dict() == {"gate": 2.0, "gate_per_s": 1.0, "gate_max": 4.0, "size_weight": 1.0,
-                                           "size_gate": 2.0, "size_hist": 3, "max_gap_s": 60.0, "dup_iou": 0.95,
-                                           "min_conf_new": 0.0}
+    assert HungarianParams().as_dict() == {
+        "sigma": 0.25, "sigma_growth": 0.05, "new_cost": 3.5, "ambiguity": 0.4, "velocity_alpha": 0.3,
+        "velocity_horizon_s": 5.0, "size_weight": 0.5, "size_gate": 2.0, "size_hist": 3, "recent_s": 4.5,
+        "reacquire_gate": 0.75, "reacquire_gate_per_s": 0.02, "reacquire_gate_max": 1.5, "reacquire_clear": 1.5,
+        "jump_gate": 2.5, "max_gap_s": 30.0, "dup_iou": 0.95, "min_conf_new": 0.0}
