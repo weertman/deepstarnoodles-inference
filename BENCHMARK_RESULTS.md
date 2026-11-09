@@ -1,5 +1,7 @@
 # Inference benchmark results — completed pilot through Round 16, 28–31 October 2026 (UTC)
 
+**0.5.0.dev13 changes only `track-videos` and `representations`, which run on the CPU.** By default `track-videos` now assigns star IDs with a post-hoc Hungarian tracker. On the backcast rehearsal's two 2 fps flipping clips and eight variants of them, one star keeps 1 ID throughout, where 0.5.0.dev12 gave it 4–11. Arm tracking runs through the vendored array tracker with identical IDs, and `track-videos` costs **0.26 ms of CPU per arm instead of 0.77**. `--star-tracker botsort` reproduces dev12 byte for byte. See [the section](#star-tracking-after-annotation-050dev13).
+
 **0.5.0.dev11 and dev12 keep what later steps need from Hydra's maps, without changing any arm.** Those maps are about 2 MiB per crop, too large to save, so dev11 keeps each star's body origin, support area and centroid, and dev12 adds the mouth, madreporite and butthole as `[x, y, p]`. dev12 also adds `track-videos`, which gives `serve-videos` output star and arm IDs. On 1,435 frames with 3,502 stars every star matched dev10 apart from the added fields; see [the section](#hydra-fields-and-tracking-after-annotation-050dev11-and-dev12).
 
 **Round 16 (0.5.0.dev10) measures the compiled pipeline on every GPU type in stock on RunPod's secure cloud. The RTX 4090 costs the least per frame.** It sustained **41.1 images/s** at $0.89/h, or $6.02 per million frames. The RTX PRO 6000 Blackwell was fastest at **67.4 images/s**, at $10.26 per million frames. The RTX 5090 was out of stock throughout. All 16 sessions were steady by the rules below, and none faulted. The round also found and fixed GPU memory growing with every video, which had tripped the device guard in its first pass. See [its section](#round-16-speed-test-across-gpu-types).
@@ -76,6 +78,48 @@ Every window's halves were within 3.8% of each other and its stars per image wit
 **Faults depend on MPS.** The same local workers, without MPS and time-slicing one GPU, hit the known illegal memory access 3 times in about 1.1 process-hours. Each was an Xid 31 MMU fault (`GPCCLIENT_GCC`, `FAULT_PDE`, `ACCESS_TYPE_VIRT_READ`), mid-video at unrelated frames. A worker forcing a cache release once a second did not fault sooner than the others, and another faulted without ever reaching its allocator limit, so cached-block release isn't the trigger. Under MPS there were none in the 31.4 worker-hours of this round, or the 13.9 streamed before it. The root cause remains unknown.
 
 **Outputs depend slightly on the GPU's chip family, with no visible bias.** Each type's two process counts agreed on every shared frame, with arms within 0.01 px. Between types, on the 5,730 frames all of them annotated (`review/round16_cross_gpu.py`), the A6000 and A40 were identical, the 4090 and RTX 6000 Ada had no arm outside 2 px, and the PRO 4500 and PRO 6000 agreed on 99.998% of arms. The L40S kept 99.7% of the 4090's arms within 2 px, and the 3090 kept 99.3% of the A6000's. Across families the figures are 98.4–98.5% with 99.7–99.8% of frames at the same star count, just under the relaxed gate's 99% line. Across all eight types, stars per frame stayed within 2.398–2.400, arms per star within 9.89–9.90, and mean arm length within 100.15–100.18 px.
+
+## Star tracking after annotation (0.5.0.dev13)
+
+**Harness.** The inputs are the backcast rehearsal's real 0.5.0.dev12 `serve-videos` records (RTX A6000, 2026-11-08):
+
+- **Flip clips:** two 4-minute flipping clips at 2 fps, each with one star. Each also comes subsampled to 1 fps and 0.5 fps, with a 15 s run of records removed, and with 5% of detections removed.
+- **Lab clips:** two synthetic 1 fps clips of validation stills, each held 5 s, with 3–5 stars per frame.
+- **Scoring:** against the paper re-trace (flip clips) and the known holds (lab clips). Every run is on one CPU thread with no GPU. CPU time excludes the 2.4 s CLI start and is the minimum of 3 runs on a Xeon W-3365 under other load.
+
+| Flip clip | Star IDs, dev12 → dev13 | Frames on the main ID | Untracked detections | Arm-ID agreement with the re-trace |
+|---|---|---|---|---|
+| R1, 2 fps | 7 → 1 | 0.31 → 1.00 | 2.3% → 0.2% | 0.37 → 0.52 |
+| R1, 1 fps | 5 → 1 | 0.31 → 1.00 | 3.8% → 0 | 0.39 → 0.51 |
+| R1, 0.5 fps | 4 → 1 | 0.30 → 1.00 | 4.2% → 0 | 0.35 → 0.45 |
+| R1, 15 s gap | 7 → 1 | 0.33 → 1.00 | 2.5% → 0.2% | 0.40 → 0.55 |
+| R1, 5% dropped | 7 → 1 | 0.31 → 1.00 | 2.9% → 0.2% | 0.37 → 0.42 |
+| R2, 2 fps | 11 → 1 | 0.34 → 1.00 | 4.8% → 0.2% | 0.42 → 0.43 |
+| R2, 1 fps | 7 → 1 | 0.33 → 1.00 | 8.8% → 0 | 0.43 → 0.42 |
+| R2, 0.5 fps | 6 → 1 | 0.33 → 1.00 | 12.5% → 0 | 0.41 → 0.36 |
+| R2, 15 s gap | 11 → 1 | 0.36 → 1.00 | 5.1% → 0.2% | 0.42 → 0.45 |
+| R2, 5% dropped | 10 → 1 | 0.35 → 1.00 | 4.8% → 0.2% | 0.42 → 0.43 |
+
+The 0.2% left untracked is one near-duplicate box per clip (IoU about 1), the less confident of the two. No detection is dropped, and no spurious box gets an ID. Arm-ID switches per 1,000 links rose on R2 (19.7 → 28.2 at 2 fps, 28.2 → 55.6 at 1 fps), because the arm tracker now follows one continuous star instead of fragments.
+
+| Lab clip | Star IDs | Holds with as many IDs as stars | Detections untracked | Untracked in their first frame | IDs carried across a cut, static/moved |
+|---|---|---|---|---|---|
+| snackpack, 129 stars | 34 → 11 | 0.96 → 1.00 | 5.6% → 0 | 24.0% → 0 | 28/17 → 27/53 |
+| stress, 97 stars | 19 → 6 | 1.00 → 0.92 | 3.3% → 2.1% | 16.5% → 2.1% | 44/13 → 44/33 |
+
+Purity is 1.000 and 0.998, against 1.000 and 0.996 for dev12. The stress clip's 2.1% are IoU-0.99 duplicate boxes, five detections of four stars, which the scorer counts as separate objects. Carries across the synthetic cuts rose, since the tracker bridges jumps BoT-SORT could not. On a two-star composite grid, the decision run found 42 swaps against dev12's 86. It merged two animals into one ID in 9 of 9 synthetic hand-overs, in which one animal leaves and another arrives nearby. [docs/track-videos.md](docs/track-videos.md) lists these costs.
+
+**CPU, ms per arm.**
+
+| Input | dev12 | dev13 `--star-tracker botsort` | dev13 default |
+|---|---|---|---|
+| Flip clips, 2 fps | 0.73–0.78 | 0.29–0.32 | 0.27–0.28 |
+| Flip clips, 1 and 0.5 fps | 0.71–0.81 | 0.26–0.40 | 0.25–0.33 |
+| lab snackpack | 0.83 | 0.24 | 0.22 |
+| lab stress | 0.79 | 0.28 | 0.25 |
+| All 12 inputs | **0.77** (24.6 s) | 0.29 (9.2 s) | **0.26** (8.4 s) |
+
+dev12 spent about 80% of its time in the package's arm tracker, mostly NumPy overhead on its per-pair shape distance. The vendored array tracker computes the same matrices in blocks and gives the same arm IDs. The tests check it against `runtime.StarArmTrackerRegistry` on real fixtures, and `--star-tracker botsort` output is byte-identical to dev12 on all 12 inputs. The remaining time on lab snackpack splits as follows: JSON writing 31%, JSON reading 22%, arm tracking 39% (half of it the resample) and star tracking 5%. At 873 million arms per camera-year, `track-videos` drops from about 190 to about 65 CPU-hours.
 
 ## Hydra fields and tracking after annotation (0.5.0.dev11 and dev12)
 
