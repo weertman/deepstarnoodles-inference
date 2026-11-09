@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: MIT
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
+from pathlib import Path
 import random
 import shutil
 import subprocess
@@ -14,6 +17,19 @@ from deepstarnoodles_inference import video_tracking
 from deepstarnoodles_inference.runtime import StarArmTrackerRegistry
 
 ARMS = 5
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "track_videos"
+REAL = ("flip_r1_f030-089.jsonl.gz", "lab_stress_f000-039.jsonl.gz")
+
+
+def real_records(name):
+    """Real dev12 serve-videos records, cut down (tests/fixtures/track_videos/README.md)."""
+    with gzip.open(FIXTURES / name, "rt", encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream]
+
+
+def dumps(records):
+    return b"".join((json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n").encode()
+                    for record in records)
 
 
 def star(center_source, angle, *, seed, confidence=0.9, side=400.0):
@@ -159,3 +175,62 @@ def test_command_refuses_to_overwrite_its_input(tmp_path):
     write(tmp_path / "day1.mp4.jsonl", video(2))
     with pytest.raises(SystemExit):
         video_tracking.main([str(tmp_path), "--output", str(tmp_path)])
+
+
+@pytest.mark.parametrize("name", REAL)
+def test_botsort_output_is_byte_identical_to_dev12(name):
+    golden = json.loads((FIXTURES / "dev12_botsort.json").read_text())[name]
+    tracked = list(video_tracking.track_records(real_records(name)))
+    ids = [[record["frame"], [[item["star_track_id"], [arm["track_id"] for arm in item["arms"]]]
+                              for item in record["stars"]], len(record["untracked_stars"])] for record in tracked]
+    assert ids == golden["ids"]
+    assert hashlib.sha256(dumps(tracked)).hexdigest() == golden["sha256"]
+
+
+def degenerate_arms(frame):
+    """Arms with one point, zero length, and lengths that cross, to reach every branch of the shape distance."""
+    arms = []
+    for k in range(6):
+        theta = 0.3 * frame + k
+        if k == 0:
+            polyline = [[256.0 + 40 * np.cos(theta), 256.0 + 40 * np.sin(theta)]]
+        elif k == 1:
+            polyline = [[300.0, 300.0]] * 4
+        else:
+            radius = np.linspace(20, 60 + 25 * k + 10 * np.sin(frame), 6 + k)[:, None]
+            polyline = (256.0 + radius * np.asarray([np.cos(theta), np.sin(theta)])).tolist()
+        identity = np.zeros(8)
+        identity[k] = 1.0 - 0.05 * (frame % 3)
+        arms.append({"polyline_crop": polyline, "identity": identity.tolist()})
+    return arms[frame % 3:] if frame % 4 else []
+
+
+@pytest.mark.parametrize("name", [*REAL, "degenerate"])
+def test_track_videos_arm_ids_match_the_runtime_registry(name):
+    """The vendored array tracker gives the arm IDs runtime.StarArmTrackerRegistry (package fused_tracker) gives."""
+    if name == "degenerate":
+        sequences = [(frame, [(1, degenerate_arms(frame), [256.0, 250.0])]) for frame in range(40)]
+    else:
+        sequences = [(record["frame"], [(item["star_track_id"], item["arms"], item["body_origin_model"])
+                                        for item in record["stars"]])
+                     for record in video_tracking.track_records(real_records(name))]
+    runtime, fast = StarArmTrackerRegistry(), video_tracking.ArmTrackers()
+    compared = 0
+    for frame, stars in sequences:
+        for star_id, arms, center in stars:
+            expected = runtime.track(star_id, frame, None, [{"polyline": arm["polyline_crop"],
+                                                             "identity": arm["identity"]} for arm in arms],
+                                     center=center)
+            assert fast.track(star_id, frame, arms, center) == expected
+            compared += len(arms)
+        runtime.prune(frame)
+        fast.prune(frame)
+        assert fast.star_track_ids == runtime.star_track_ids
+    assert compared > 100
+
+
+def test_arm_trackers_refuse_non_finite_input():
+    arms = degenerate_arms(1)
+    arms[2]["identity"][0] = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        video_tracking.ArmTrackers().track(1, 0, arms, [256.0, 256.0])

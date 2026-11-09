@@ -22,8 +22,11 @@ import sys
 
 import numpy as np
 
+from ._vendor.noodle_polylines import _assoc
+from ._vendor.noodle_polylines.geometry import resample_tip
+from ._vendor.noodle_polylines.tracking import RELEASED, TrackerConfig
 from .paths import DEFAULT_BOTSORT_CONFIG
-from .runtime import StarArmTrackerRegistry
+from .runtime import DEFAULT_STAR_TRACK_MAX_AGE, K_TRACK
 
 SUFFIXES = (".jsonl", ".jsonl.zst")
 
@@ -46,6 +49,63 @@ class _Boxes:
         return _Boxes(self.xyxy[index], self.conf[index], self.cls[index])
 
 
+class ArmTrackers:
+    """One released arm tracker per star ID, as :class:`runtime.StarArmTrackerRegistry` keeps for live replay.
+
+    Each star's arms go through the vendored ``noodle_polylines`` array-state FusedTracker with the released settings
+    (shape gate 120 px, embedding weight 2.0, max age 16 arm-bearing updates, match-cost cap 90, k = 12), which
+    gives the arm IDs the package's ``fused_tracker`` gives, bit for bit, about 40 times faster. A star whose record
+    has no arms does not step its tracker, so missing arms do not age arm tracks.
+    """
+
+    def __init__(self, config: TrackerConfig = RELEASED) -> None:
+        if config.vel_alpha != 0 or config.k != K_TRACK:
+            raise ValueError("the array tracker reproduces the released settings only (vel_alpha 0, k 12)")
+        self.config = config
+        self._trackers: dict[int, _assoc.ArrayTracker] = {}
+        self._last_seen: dict[int, int] = {}
+
+    @property
+    def star_track_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(self._trackers))
+
+    def track(self, star_track_id: int, frame: int, arms: list[dict], center) -> list[int]:
+        """Arm IDs for one star's arms (``polyline_crop``, ``identity``) measured from its body ``center``."""
+        star_track_id = int(star_track_id)
+        tracker = self._trackers.get(star_track_id)
+        if tracker is None:
+            tracker = self._trackers[star_track_id] = _assoc.ArrayTracker(self.config, self.config.k)
+        self._last_seen[star_track_id] = int(frame)
+        if not arms:
+            return []
+        polylines = [arm["polyline_crop"] for arm in arms]
+        counts = [len(polyline) for polyline in polylines]
+        points = np.asarray([point for polyline in polylines for point in polyline], dtype=np.float32)
+        if min(counts) < 1 or points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError(f"frame {frame}: every arm polyline_crop must be a non-empty list of [x, y] points")
+        offsets = np.zeros(len(counts) + 1, dtype=np.int64)
+        np.cumsum(counts, out=offsets[1:])
+        origin = np.broadcast_to(np.asarray(center, dtype=np.float32).reshape(2), (len(arms), 2))
+        sampled, lengths = resample_tip(points, offsets, self.config.k, arm_origin=origin)
+        lengths = lengths.astype(np.float32)
+        embeds = np.asarray([arm["identity"] for arm in arms], dtype=np.float32)
+        if embeds.ndim != 2 or not _assoc.fast_path_ok(self.config, sampled, lengths, embeds,
+                                                         np.arange(len(arms))):
+            raise ValueError(f"frame {frame}: arm polylines, identities and the body origin must be finite")
+        rows = _assoc.arm_rows(sampled, lengths, self.config.k)
+        return tracker.step(rows, embeds, sampled, lengths).tolist()
+
+    def discard(self, star_track_id: int) -> None:
+        """Forget one star's arm tracker (its star track ended)."""
+        self._trackers.pop(int(star_track_id), None)
+        self._last_seen.pop(int(star_track_id), None)
+
+    def prune(self, frame: int, max_age: int = DEFAULT_STAR_TRACK_MAX_AGE) -> None:
+        """Forget stars unseen for more than ``max_age`` frames (live replay's BoT-SORT horizon)."""
+        for star_track_id in [key for key, seen in self._last_seen.items() if int(frame) - seen > max_age]:
+            self.discard(star_track_id)
+
+
 def star_tracker(config: Path = DEFAULT_BOTSORT_CONFIG):
     """A fresh BoT-SORT with the configuration live replay uses."""
     from ultralytics.trackers.bot_sort import BOTSORT
@@ -65,7 +125,7 @@ def track_records(records: Iterable[dict], *, tracker_config: Path = DEFAULT_BOT
     from ultralytics.trackers.basetrack import BaseTrack
 
     tracker = star_tracker(tracker_config)
-    registry = StarArmTrackerRegistry()
+    registry = ArmTrackers()
     # Live replay numbers each video's stars from 1 (crop.TrackedStarCropper); this runs one video at a time.
     BaseTrack.reset_id()
     previous = None
@@ -93,8 +153,7 @@ def track_records(records: Iterable[dict], *, tracker_config: Path = DEFAULT_BOT
             if "body_origin_model" not in star:
                 raise ValueError("these records have no body origin; annotate the video with "
                                  "deepstarnoodles-inference 0.5.0.dev11 or later")
-            arms = [{"polyline": arm["polyline_crop"], "identity": arm["identity"]} for arm in star["arms"]]
-            labels = registry.track(star_id, frame, None, arms, center=star["body_origin_model"])
+            labels = registry.track(star_id, frame, star["arms"], star["body_origin_model"])
             for arm, label in zip(star["arms"], labels):
                 arm["track_id"] = int(label)
             tracked.append(star)
