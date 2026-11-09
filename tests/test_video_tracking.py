@@ -375,3 +375,112 @@ def test_botsort_maps_low_confidence_matches_back_to_their_detections(tmp_path, 
         assert all(side(item) == "right" for item in record["untracked_stars"])
     if not fuse_score:   # without score fusion the 0.2 detections match star 2 in the second pass
         assert all({item["star_track_id"] for item in record["stars"]} == {1, 2} for record in tracked)
+
+
+needs_zstd = pytest.mark.skipif(shutil.which("zstd") is None, reason="zstd not installed")
+
+
+def run_command(capsys, *argv):
+    code = video_tracking.main([*map(str, argv), "--jobs", "1"])
+    captured = capsys.readouterr()
+    return code, [json.loads(line) for line in captured.out.splitlines()], captured.err
+
+
+@pytest.mark.parametrize("star_tracker", video_tracking.STAR_TRACKERS)
+def test_tracked_records_are_refused_rather_than_tracked_again(tmp_path, capsys, star_tracker):
+    write(tmp_path / "raw" / "day1.mp4.jsonl", video(6, late=2))
+    code, _, _ = run_command(capsys, tmp_path / "raw", "--output", tmp_path / "once", "--star-tracker", star_tracker)
+    assert code == 0
+    code, _, err = run_command(capsys, tmp_path / "once", "--output", tmp_path / "twice")
+    assert code == 1 and "already have star IDs" in err
+    assert not (tmp_path / "twice" / "day1.mp4.jsonl").exists()
+    assert list((tmp_path / "twice").glob("*.part")) == []
+    live = video(2)
+    live[1]["stars"][0]["star_track_id"] = 4          # live-replay style records carry IDs but no untracked_stars
+    with pytest.raises(ValueError, match="already have star IDs"):
+        list(video_tracking.track_records(live, star_tracker=star_tracker))
+
+
+def test_an_output_directory_inside_the_input_is_not_read_back(tmp_path, capsys):
+    raw = tmp_path / "annotations"
+    write(raw / "cam1" / "day1.mp4.jsonl", video(4))
+    for _ in range(2):
+        code, lines, _ = run_command(capsys, raw, "--output", raw / "tracked", "--overwrite")
+        assert code == 0 and lines[0]["videos"] == 1
+    assert sorted(p.relative_to(raw).as_posix() for p in raw.rglob("*.jsonl")) == [
+        "cam1/day1.mp4.jsonl", f"tracked/{video_tracking.RUN_LOG}", "tracked/cam1/day1.mp4.jsonl"]
+    with pytest.raises(SystemExit):
+        video_tracking.main([str(raw), "--output", str(raw)])
+
+
+def test_records_without_a_stars_list_are_refused():
+    records = video(3)
+    del records[1]["stars"]
+    with pytest.raises(ValueError, match="no 'stars' list"):
+        list(video_tracking.track_records(records))
+
+
+@pytest.mark.parametrize("suffix", [".jsonl", pytest.param(".jsonl.zst", marks=needs_zstd)])
+def test_a_truncated_file_names_the_line_and_leaves_no_part_file(tmp_path, capsys, suffix):
+    text = "".join(json.dumps(record) + "\n" for record in video(5))
+    cut = text[:text.rindex("\n", 0, len(text) - 1) + 40]          # the last record is cut 40 bytes in
+    source = tmp_path / "in" / f"day1.mp4{suffix}"
+    source.parent.mkdir()
+    if suffix == ".jsonl":
+        source.write_text(cut)
+    else:
+        whole = subprocess.run(["zstd", "-q", "-c"], input=text.encode(), capture_output=True, check=True).stdout
+        source.write_bytes(whole[:len(whole) * 3 // 4])
+    code, _, err = run_command(capsys, tmp_path / "in", "--output", tmp_path / "out")
+    assert code == 1
+    if suffix == ".jsonl":
+        assert "line 5 (after frame 3) is not a JSON record" in err and "truncated" in err
+    else:
+        assert "zstd could not read" in err
+    assert [p.name for p in (tmp_path / "out").iterdir()] == [video_tracking.RUN_LOG]
+
+
+def test_blank_lines_are_skipped(tmp_path):
+    lines = [json.dumps(record) for record in video(4)]
+    clean, blank = tmp_path / "clean.jsonl", tmp_path / "blank.jsonl"
+    clean.write_text("\n".join(lines) + "\n")
+    blank.write_text("\n\n".join(lines) + "\n  \n\n")
+    video_tracking.track_file(clean, tmp_path / "a" / "x.jsonl")
+    video_tracking.track_file(blank, tmp_path / "b" / "x.jsonl")
+    assert (tmp_path / "a" / "x.jsonl").read_bytes() == (tmp_path / "b" / "x.jsonl").read_bytes()
+
+
+def test_an_empty_file_is_an_error(tmp_path, capsys):
+    (tmp_path / "in").mkdir()
+    (tmp_path / "in" / "day1.mp4.jsonl").write_text("")
+    (tmp_path / "in" / "day2.mp4.jsonl").write_text("\n")
+    write(tmp_path / "in" / "day3.mp4.jsonl", [{"frame": 0, "stars": []}])
+    code, lines, err = run_command(capsys, tmp_path / "in", "--output", tmp_path / "out")
+    assert code == 1 and err.count("holds no records") == 2
+    assert lines[-1]["video"].endswith("day3.mp4.jsonl") and lines[-1]["frames"] == 1
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == [video_tracking.RUN_LOG, "day3.mp4.jsonl"]
+
+
+@needs_zstd
+def test_one_video_in_two_formats_is_refused(tmp_path, capsys):
+    write(tmp_path / "in" / "day1.mp4.jsonl", video(2))
+    write(tmp_path / "in" / "day1.mp4.jsonl.zst", video(2))
+    with pytest.raises(SystemExit):
+        video_tracking.main([str(tmp_path / "in"), "--output", str(tmp_path / "out")])
+    assert "are the same video" in capsys.readouterr().err
+    write(tmp_path / "camA" / "day9.mp4.jsonl", video(2))
+    write(tmp_path / "camB" / "day9.mp4.jsonl", video(2))
+    with pytest.raises(SystemExit):
+        video_tracking.main([str(tmp_path / "camA" / "day9.mp4.jsonl"), str(tmp_path / "camB" / "day9.mp4.jsonl"),
+                             "--output", str(tmp_path / "out")])
+    assert "would both be tracked into" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+@needs_zstd
+def test_a_symlinked_zst_file_is_read(tmp_path):
+    write(tmp_path / "store" / "day1.mp4.jsonl.zst", video(3))
+    (tmp_path / "in").mkdir()
+    (tmp_path / "in" / "day1.mp4.jsonl.zst").symlink_to(tmp_path / "store" / "day1.mp4.jsonl.zst")
+    assert video_tracking.main([str(tmp_path / "in"), "--output", str(tmp_path / "out"), "--jobs", "1"]) == 0
+    assert len(read(tmp_path / "out" / "day1.mp4.jsonl.zst")) == 3

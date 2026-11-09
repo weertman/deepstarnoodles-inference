@@ -125,12 +125,20 @@ RUN_LOG = "_track-videos.jsonl"   # one line per video tracked into an --output 
 
 
 def _frames_in_order(records: Iterable[dict]) -> Iterator[tuple[int, dict]]:
+    """``(frame, record)`` for serve-videos records in increasing frame order; anything else is refused."""
     previous = None
     for record in records:
         frame = int(record["frame"])
         if previous is not None and frame <= previous:
             raise ValueError(f"frames must increase within a video; frame {frame} came after {previous}")
         previous = frame
+        if "stars" not in record:
+            raise ValueError(f"frame {frame}: the record has no 'stars' list; track-videos reads serve-videos "
+                             "records (multi-star, output schema 3 or later)")
+        if ("untracked_stars" in record or "star_tracking" in record
+                or any(star.get("star_track_id") is not None for star in record["stars"])):
+            raise ValueError(f"frame {frame}: these records already have star IDs (track-videos or live output); "
+                             "run track-videos once, on the serve-videos annotations")
         yield frame, record
 
 
@@ -154,8 +162,8 @@ def _split(registry: ArmTrackers, frame: int, stars: list[dict], star_ids: list[
             untracked.append(star)
             continue
         if "body_origin_model" not in star:
-            raise ValueError("these records have no body origin; annotate the video with "
-                             "deepstarnoodles-inference 0.5.0.dev11 or later")
+            raise ValueError(f"frame {frame}: a star has no body origin (records from before 0.5.0.dev11); annotate "
+                             "the video with deepstarnoodles-inference 0.5.0.dev11 or later")
         labels = registry.track(star_id, frame, star["arms"], star["body_origin_model"])
         for arm, label in zip(star["arms"], labels):
             arm["track_id"] = int(label)
@@ -247,17 +255,53 @@ def track_records(records: Iterable[dict], *, star_tracker: str = "hungarian", s
     return _track_records_hungarian(records, params)
 
 
+def _parse_lines(lines: Iterable[bytes], path: Path) -> Iterator[dict]:
+    """JSON records, one per line; blank lines are skipped (as ``representations`` does)."""
+    last = None
+    for number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            reason = exc.msg if isinstance(exc, json.JSONDecodeError) else "not UTF-8"
+            where = "before any record" if last is None else f"after frame {last}"
+            raise ValueError(f"{path}: line {number} ({where}) is not a JSON record ({reason}); the file is "
+                             "truncated or corrupt") from None
+        if not isinstance(record, dict) or "frame" not in record:
+            raise ValueError(f"{path}: line {number} is not a frame record")
+        last = record["frame"]
+        yield record
+
+
 def read_records(path: Path) -> Iterator[dict]:
-    if path.name.endswith(".zst"):
-        with subprocess.Popen(["zstd", "-dcq", str(path)], stdout=subprocess.PIPE) as process:
-            for line in process.stdout:
-                yield json.loads(line)
-        if process.returncode:
-            raise OSError(f"zstd could not read {path}")
+    """One video's records from ``.jsonl`` or ``.jsonl.zst`` (through the ``zstd`` command, which reports truncation)."""
+    path = Path(path)
+    if not path.name.endswith(".zst"):
+        with path.open("rb") as stream:
+            yield from _parse_lines(stream, path)
         return
-    with path.open(encoding="utf-8") as stream:
-        for line in stream:
-            yield json.loads(line)
+    # zstd reads stdin, so a symlinked file works (zstd itself skips symlinks given as arguments).
+    with path.open("rb") as raw, subprocess.Popen(["zstd", "-dcq"], stdin=raw, stdout=subprocess.PIPE,
+                                                  stderr=subprocess.PIPE) as process:
+        def failed() -> OSError | None:
+            for _ in iter(lambda: process.stdout.read(1 << 20), b""):
+                pass                                      # let zstd finish, so it reports its own error
+            if process.wait():
+                return OSError(f"zstd could not read {path} ({process.stderr.read().decode().strip()}); the file "
+                               "is truncated or corrupt")
+            return None
+
+        try:
+            yield from _parse_lines(process.stdout, path)
+        except ValueError:
+            error = failed()
+            if error is not None:
+                raise error from None
+            raise
+        error = failed()
+        if error is not None:
+            raise error
 
 
 def track_file(source: Path, destination: Path, tracker_config: Path | None = None, *,
@@ -287,34 +331,66 @@ def track_file(source: Path, destination: Path, tracker_config: Path | None = No
                 counts["star_ids"].add(star["star_track_id"])
             yield (json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n").encode()
 
-    if destination.name.endswith(".zst"):
-        with subprocess.Popen(["zstd", "-q", "-f", "-o", str(partial)], stdin=subprocess.PIPE) as process:
-            for line in lines():
-                process.stdin.write(line)
-            process.stdin.close()
-        if process.returncode:
-            raise OSError(f"zstd could not write {partial}")
-    else:
-        with partial.open("wb") as stream:
-            for line in lines():
-                stream.write(line)
-    os.replace(partial, destination)
+    try:
+        if destination.name.endswith(".zst"):
+            with subprocess.Popen(["zstd", "-q", "-f", "-o", str(partial)], stdin=subprocess.PIPE) as process:
+                for line in lines():
+                    process.stdin.write(line)
+                process.stdin.close()
+            if process.returncode:
+                raise OSError(f"zstd could not write {partial}")
+        else:
+            with partial.open("wb") as stream:
+                for line in lines():
+                    stream.write(line)
+        if not counts["frames"]:
+            raise ValueError(f"{source} holds no records")
+        os.replace(partial, destination)
+    except BaseException:
+        partial.unlink(missing_ok=True)       # nothing half-written is left behind
+        raise
     counts["star_ids"] = len(counts["star_ids"])
     return counts
 
 
+def _video_name(path: Path) -> str:
+    return path.name[:-4] if path.name.endswith(".zst") else path.name
+
+
 def find_inputs(inputs: list[Path], output: Path) -> list[tuple[Path, Path]]:
-    """``(source, destination)`` pairs; a directory is searched recursively and mirrored under ``output``."""
+    """``(source, destination)`` pairs; a directory is searched recursively and mirrored under ``output``.
+
+    Files under ``output`` are never inputs (an output directory inside an input directory is not read back), nor
+    are the fleet's and serve-videos' own files (names starting with ``_``, ``worker.``, ``report.``, ``service.``).
+    Refuses ``x.jsonl`` next to ``x.jsonl.zst`` (one video twice) and two inputs with one destination.
+    """
+    output_resolved = output.resolve()
     pairs = []
     for item in inputs:
         if item.is_dir():
+            if item.resolve() == output_resolved:
+                raise ValueError("--output would overwrite the input records; choose another directory")
+            nested = item.resolve() in output_resolved.parents
             sources = sorted(path for path in item.rglob("*") if path.is_file() and path.name.endswith(SUFFIXES)
-                             and not path.name.startswith(("_", "worker.", "report.", "service.")))
+                             and not path.name.startswith(("_", "worker.", "report.", "service."))
+                             and not (nested and output_resolved in path.resolve().parents))
             pairs += [(path, output / path.relative_to(item)) for path in sources]
         elif item.is_file() and item.name.endswith(SUFFIXES):
             pairs.append((item, output / item.name))
         else:
             raise FileNotFoundError(f"{item} is neither a directory nor a .jsonl or .jsonl.zst file")
+    videos: dict[Path, Path] = {}
+    destinations: dict[Path, Path] = {}
+    for source, destination in pairs:
+        video = source.parent.resolve() / _video_name(source)
+        if video in videos and videos[video] != source:
+            raise ValueError(f"{videos[video]} and {source} are the same video; keep one of them")
+        videos[video] = source
+        key = destination.parent.resolve() / _video_name(destination)
+        if key in destinations and destinations[key].resolve() != source.resolve():
+            raise ValueError(f"{destinations[key]} and {source} would both be tracked into {destination}; "
+                             "track them into separate --output directories")
+        destinations[key] = source
     return pairs
 
 
@@ -359,7 +435,10 @@ def main(argv=None) -> int:
         parser.error(str(exc))
     if tracker_config is not None and not tracker_config.is_file():
         parser.error(f"--tracker-config {tracker_config} does not exist")
-    pairs = find_inputs(args.inputs, args.output)
+    try:
+        pairs = find_inputs(args.inputs, args.output)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     if any(source.resolve() == destination.resolve() for source, destination in pairs):
         parser.error("--output would overwrite the input records; choose another directory")
     todo = [(source, destination, star_tracker, params, tracker_config) for source, destination in pairs
