@@ -3,9 +3,10 @@
 # golden fixtures with `golden_svd` (rtol 1e-12) instead of bit-for-bit. LAPACK's SVD differs in the last
 # bits between numpy builds (2.5.4 / scipy 1.18.1 give up to 4e-15 off the fixtures, which pyproject allows).
 # Every comparison against the in-process reference stays bit-exact. Other comparisons against the stored
-# fixtures use `golden`: integers, masks and NaN positions exact, floats within rtol 1e-5, because the
-# float32 arithmetic of the figure scripts rounds differently on other CPUs (a GitHub runner gave up to
-# 7.4e-7 on curvature values of 0.1-0.9; the in-process reference matched bit for bit there).
+# fixtures use `golden`: integers, masks and NaN positions exact, finite floats within 1e-5 of each array's
+# largest value. The figure scripts' float32 arithmetic rounds differently on other CPUs: on a GitHub runner,
+# arc length and curvature differed by up to 1.2e-5 relative on small values and fig5 measures by 7.4e-7 on
+# values of 0.1-0.9, while every in-process reference comparison there matched bit for bit.
 """Public noodle_polylines API == _reference (figure-script ports) == golden fixtures, on the micro example."""
 from __future__ import annotations
 
@@ -33,13 +34,21 @@ def same(a, b):
     assert np.array_equal(a, b, equal_nan=a.dtype.kind == 'f'), np.nanmax(np.abs(a.astype(float) - b.astype(float)))
 
 
-def golden(a, b):
-    """Fixtures stored on another machine: integers, masks and NaN positions exact, floats within rtol 1e-5."""
+def golden(a, b, tol=1e-5):
+    """Fixtures stored on another machine: integers, masks and NaN/inf positions exact; finite floats within
+    `tol` of the array's largest magnitude. Float32 sums round to the size of their terms, not of the result,
+    so small values (e.g. low curvature) can differ by more than their own rtol."""
     a, b = np.asarray(a), np.asarray(b)
-    if a.dtype.kind in 'fc' or b.dtype.kind in 'fc':
-        close(a, b, rtol=1e-5)
-    else:
+    if a.dtype.kind not in 'fc' and b.dtype.kind not in 'fc':
         same(a, b)
+        return
+    a, b = a.astype(float), b.astype(float)
+    assert a.shape == b.shape, (a.shape, b.shape)
+    fa, fb = np.isfinite(a), np.isfinite(b)
+    assert np.array_equal(fa, fb) and np.array_equal(a[~fa], b[~fb], equal_nan=True)
+    if fa.any():
+        scale = np.max(np.abs(b[fb]))
+        assert np.all(np.abs(a[fa] - b[fb]) <= tol * scale), (np.max(np.abs(a[fa] - b[fb])), scale)
 
 
 def golden_svd(a, b):
