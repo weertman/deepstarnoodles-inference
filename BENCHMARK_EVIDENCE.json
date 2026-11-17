@@ -11747,11 +11747,10 @@
     },
     "cost_usd": {
       "dev10_runs": 4.89,
-      "earlier_dev9_pass": 0.9
+      "earlier_dev9_pass": 0.9,
+      "rtx5090_2026_11_08": 0.87
     },
-    "out_of_stock": [
-      "NVIDIA GeForce RTX 5090"
-    ],
+    "out_of_stock": [],
     "gpus": {
       "3090": {
         "gpu": "NVIDIA GeForce RTX 3090",
@@ -11873,6 +11872,70 @@
               0.0,
               0.0,
               0.0
+            ],
+            "paired_arms_steps_changed": 0,
+            "passes": true
+          }
+        }
+      },
+      "5090": {
+        "gpu": "NVIDIA GeForce RTX 5090",
+        "gpu_memory_mib": 32607.0,
+        "lease_id": "2d5cbd306f31",
+        "usd_per_hour": 1.19,
+        "best_processes": 12,
+        "images_per_second": 58.1,
+        "usd_per_million_frames": 5.69,
+        "usd_per_camera_year": 179.4,
+        "measured_utc": "2026-11-08",
+        "sessions": {
+          "P10": {
+            "processes": 10,
+            "images_per_second": 57.84,
+            "star_crops_per_second": 162.1,
+            "stars_per_image": 2.802,
+            "steady": true,
+            "half_drift": 0.0102,
+            "stars_vs_mix": 0.0152,
+            "ready_empty_fraction": 0.0,
+            "allocator_limit_gib": 2.48,
+            "peak_device_memory_mib": 21719.0,
+            "mean_gpu_utilization_percent": 99.3,
+            "mean_power_watts": 572.6,
+            "mean_cpu_cores": 6.5,
+            "stop_reason": "session_time",
+            "exit_code": 0,
+            "video_errors": 0
+          },
+          "P12": {
+            "processes": 12,
+            "images_per_second": 58.1,
+            "star_crops_per_second": 163.2,
+            "stars_per_image": 2.809,
+            "steady": true,
+            "half_drift": 0.007,
+            "stars_vs_mix": 0.0178,
+            "ready_empty_fraction": 0.0,
+            "allocator_limit_gib": 2.0,
+            "peak_device_memory_mib": 25793.0,
+            "mean_gpu_utilization_percent": 99.2,
+            "mean_power_watts": 572.1,
+            "mean_cpu_cores": 6.78,
+            "stop_reason": "session_time",
+            "exit_code": 0,
+            "video_errors": 0
+          }
+        },
+        "same_gpu_agreement": {
+          "P12": {
+            "frames_compared": 5850,
+            "frames_same_star_count": 5850,
+            "reference_arms": 138263,
+            "arms_within_2px_fraction": 1.0,
+            "paired_arm_chamfer_p50_p99_max": [
+              0.0,
+              0.0,
+              0.0018616899036744635
             ],
             "paired_arms_steps_changed": 0,
             "passes": true
@@ -12498,6 +12561,21 @@
           "paired_arms_steps_changed": 10,
           "passes": true
         }
+      },
+      "rtx5090_vs_a6000": {
+        "frames_compared": 5850,
+        "frames_same_star_count": 5838,
+        "arms_within_2px_fraction": 0.9840962042168936,
+        "candidate_arms_within_2px_fraction": 0.9836905028821883,
+        "paired_arms_steps_changed": 733,
+        "passes": false
+      }
+    },
+    "measured_later": {
+      "NVIDIA GeForce RTX 5090": {
+        "date_utc": "2026-11-08",
+        "reason": "no secure stock during the 2026-10-31 runs",
+        "harness": "same frozen round16d bundle, wheel 0.5.0.dev10 (sha256 445e299b...), same 48-segment subset and window rules"
       }
     }
   }
