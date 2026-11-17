@@ -12,7 +12,7 @@ The trained models are YOLO26-L segmentation, **DINOv3 ConvNeXt-Base** and a GRU
 | [docs/representations.md](docs/representations.md) | Turning output into the paper's polyline representations |
 | [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) | Every measurement, with rates per GPU type, output agreement and memory |
 
-**Version note.** This branch is 0.5.0.dev13. It writes output schema 4. Schema 3 (0.5.0.dev11) added each star's body origin, support area and centroid and each frame's time, along with the `representations` command. Schema 4 adds each star's mouth, madreporite and butthole positions and probabilities, and 0.5.0.dev12 adds the `track-videos` command. 0.5.0.dev13 changes only the CPU commands: `track-videos` assigns star IDs with a tracker built for 1–2 fps records by default, and both it and `representations` refuse or flag incomplete inputs. `serve-videos`, `live` and `live-replay` output is unchanged. The published container image is still 0.4.0, so it lacks `serve-videos`, `track-videos`, `representations` and most options in the commands below. Install from source or build the image from this repository, as shown next.
+**Version note.** This branch is 0.5.0.dev14. It writes output schema 4. Schema 3 (0.5.0.dev11) added each star's body origin, support area and centroid and each frame's time, along with the `representations` command. Schema 4 adds each star's mouth, madreporite and butthole positions and probabilities, and 0.5.0.dev12 adds the `track-videos` command. 0.5.0.dev13 changes only the CPU commands: `track-videos` assigns star IDs with a tracker built for 1–2 fps records by default, and both it and `representations` refuse or flag incomplete inputs. `serve-videos`, `live` and `live-replay` output is unchanged. 0.5.0.dev14 lets a model manifest set the tracer's invalid-seed threshold and adds manifests for three detectors (see [Get the models](#get-the-models)); with an earlier manifest the output is unchanged. The published container image is still 0.4.0, so it lacks `serve-videos`, `track-videos`, `representations` and most options in the commands below. Install from source or build the image from this repository, as shown next.
 
 ## Install
 
@@ -39,16 +39,28 @@ Inside the container the same commands run as `docker run --rm --gpus all --shm-
 
 ## Get the models
 
-The checkpoints are published in [models-seed0-20261028](https://github.com/weertman/deepstarnoodles-inference/releases/tag/models-seed0-20261028), about 793 MB in total. This downloads them and verifies their SHA-256 hashes:
+The checkpoints are published in [models-20261117](https://github.com/weertman/deepstarnoodles-inference/releases/tag/models-20261117) and, with the same file names and hashes, in the [Hugging Face model repository](https://huggingface.co/weertman/deepstarnoodles). One Hydra and one tracer are shared by three detectors, which differ in how the objects that are not sunflower sea stars were labelled in training:
+
+| Manifest | Detector classes | Test precision | Test recall | Test F1 |
+|---|---|---|---|---|
+| `manifest.json` | 2: sunflower sea star, anything else annotated (the detector of the paper) | 0.920 | 0.903 | 0.911 |
+| `manifest.fine.json` | 37: sunflower sea star, 26 other sea star species, urchins, bivalves, sand dollars, dead prey and unidentified animals | 0.941 | 0.902 | 0.921 |
+| `manifest.coarse.json` | 4: sunflower sea star, other sea star, live prey, dead prey | 0.934 | 0.909 | 0.921 |
+
+The scores are for sunflower sea stars on the 1,249 test images of the frozen detection dataset, seed 0, matched one to one at a mask IoU of at least 0.5 and a confidence of at least 0.25. Recall is lower in field images: 0.67, 0.66 and 0.69 without the Prince William Sound cruise, in the order of the table. Each manifest records the scores by image source. Whichever detector is used, only detections of the sunflower sea star class are cropped and traced.
+
+This downloads one detector with Hydra and the tracer, about 793 MB, and verifies the SHA-256 hashes:
 
 ```bash
 curl -fL -o manifest.json \
-  https://github.com/weertman/deepstarnoodles-inference/releases/download/models-seed0-20261028/manifest.json
+  https://github.com/weertman/deepstarnoodles-inference/releases/download/models-20261117/manifest.json
 deepstarnoodles-inference fetch-models --models manifest.json --destination models
 deepstarnoodles-inference verify-models --models models/
 ```
 
-`models/` must not already exist. Nothing is downloaded implicitly during inference. Checkpoint loading uses PyTorch serialization, so only load trusted weights whose hashes match the manifest.
+For another detector, download `manifest.fine.json` or `manifest.coarse.json` in place of `manifest.json`. `models/` must not already exist. Nothing is downloaded implicitly during inference. Checkpoint loading uses PyTorch serialization, so only load trusted weights whose hashes match the manifest.
+
+The tracer record of these manifests sets `invalid_seed_threshold` to 0.6, the value chosen on the validation split and used in the paper. The checkpoint itself stores no threshold, so a manifest without the field traces every seed. The earlier release [models-seed0-20261028](https://github.com/weertman/deepstarnoodles-inference/releases/tag/models-seed0-20261028) has the same Hydra and tracer with a one-class detector and no threshold; the measurements in [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) used it.
 
 ## Annotate videos
 
