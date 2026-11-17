@@ -6,7 +6,9 @@
   "models": {
     "starseg": {
       "path": "starseg_fine.pt",
-      "sha256": "21d146133d0a65561820df5d8a8e675852646efcd0e105eb0edfb1f668ecc888",
+      "sha256": "d46917b7a5e8eaecf337c2ddbd0e128aa2b24d54a6b6a98392118a44b5254699",
+      "as_trained_sha256": "21d146133d0a65561820df5d8a8e675852646efcd0e105eb0edfb1f668ecc888",
+      "as_trained_note": "The published file is the run's terminal checkpoint with the absolute paths of the training machine replaced by relative ones; every weight tensor is bit-identical to the file as trained.",
       "architecture": "yolo26l-seg",
       "run_id": "T1_l_F_adamw_e050_seed0",
       "checkpoint_rule": "terminal_last",
@@ -15,7 +17,7 @@
       "target_class_name": "Pycnopodia_helianthoides",
       "scientific_name": "Pycnopodia_helianthoides",
       "seed": 0,
-      "checkpoint_bytes": 63575685,
+      "checkpoint_bytes": 63650270,
       "checkpoint_parameters": 31438171,
       "image_size": 1024,
       "dataset_split_id": "starseg-20261106-64f5f09f0ced",

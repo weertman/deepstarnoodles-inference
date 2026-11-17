@@ -6,7 +6,9 @@
   "models": {
     "starseg": {
       "path": "starseg_binary.pt",
-      "sha256": "e48c5ce4c0ca9f9617e0856a2d3bdac17a4326bd463d5df4775c650f85bee0ba",
+      "sha256": "1a38e2dab1a3e6937297e397fc7778f05746a8db2b64b851b561d6379d1f2592",
+      "as_trained_sha256": "e48c5ce4c0ca9f9617e0856a2d3bdac17a4326bd463d5df4775c650f85bee0ba",
+      "as_trained_note": "The published file is the run's terminal checkpoint with the absolute paths of the training machine replaced by relative ones; every weight tensor is bit-identical to the file as trained.",
       "architecture": "yolo26l-seg",
       "run_id": "T1_l_B_adamw_e050_seed0",
       "checkpoint_rule": "terminal_last",
@@ -15,7 +17,7 @@
       "target_class_name": "sunflower_star",
       "scientific_name": "Pycnopodia_helianthoides",
       "seed": 0,
-      "checkpoint_bytes": 63448709,
+      "checkpoint_bytes": 63525766,
       "checkpoint_parameters": 31375206,
       "image_size": 1024,
       "dataset_split_id": "starseg-20261106-64f5f09f0ced",
